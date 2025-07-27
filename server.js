@@ -180,15 +180,20 @@ const server = http.createServer((req, res) => {
           }
 
           // Build the body for WA API: form‑urlencoded with channel, source,
-          // destination, message JSON string and src.name (app name). Replace
-          // the placeholders below with your actual WhatsApp number and
-          // application name before running.
+          // destination, message JSON string and src.name (app name).
+          // The WhatsApp source number and application name are read from
+          // environment variables so they can be configured without
+          // hard‑coding sensitive data.  For local development you can
+          // optionally set GSWHATSAPP_NUMBER and GSAPP_NAME in a .env file
+          // or your deployment environment (e.g., Render dashboard).
           const params = new URLSearchParams();
           params.append('channel', 'whatsapp');
-          params.append('source', '5521998051860');
+          const srcNumber = process.env.GSWHATSAPP_NUMBER || '<SEU_NUMERO_WHATSAPP>';
+          const appName = process.env.GSAPP_NAME || '<NOME_DA_SUA_APP>';
+          params.append('source', srcNumber);
           params.append('destination', to);
           params.append('message', JSON.stringify({ type: 'text', text }));
-          params.append('src.name', 'odontologiadhmed');
+          params.append('src.name', appName);
           const postBody = params.toString();
 
           const options = {
@@ -197,7 +202,7 @@ const server = http.createServer((req, res) => {
             method: 'POST',
             headers: {
               'Content-Type': 'application/x-www-form-urlencoded',
-              'apikey': token,
+              apikey: token,
               'Content-Length': Buffer.byteLength(postBody)
             }
           };
@@ -229,6 +234,16 @@ const server = http.createServer((req, res) => {
   // Webhook endpoint – receives messages from GupShup and associates
   // them with the correct instance. The exact shape of the payload
   // depends on your webhook configuration.
+  // Respond to GET requests on the webhook path so services like
+  // GupShup can validate that the URL is reachable. GupShup performs
+  // a GET request before accepting a webhook URL; without this
+  // handler it receives a 404 and reports "Invalid URL". We simply
+  // return a 200 OK with a basic JSON payload.
+  if (req.method === 'GET' && pathname === '/api/webhook') {
+    sendJSON(res, 200, { status: 'ok' });
+    return;
+  }
+
   if (req.method === 'POST' && pathname === '/api/webhook') {
     parseRequestBody(req, (err, data) => {
       if (err) {
@@ -423,12 +438,14 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Default 404 for unknown routes
+// Default 404 for unknown routes
   sendJSON(res, 404, { error: 'Not found' });
 });
 
 // Change this value if you need to expose the server on a different port
-const PORT = 5001;
+// Use the PORT provided by the environment when deployed (e.g., on Render)
+// fallback to 5001 for local development.
+const PORT = process.env.PORT || 5001;
 server.listen(PORT, () => {
   console.log(`Back‑end server listening on port ${PORT}`);
 });
