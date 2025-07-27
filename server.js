@@ -384,7 +384,7 @@ const server = http.createServer((req, res) => {
   }
 
   // GET /api/conversation/:id/messages – list messages for a conversation
-  const convMessagesMatch = pathname.match(/^\/api\/conversation\/(.+)/messages$/);
+  const convMessagesMatch = pathname.match(/^\/api\/conversation\/(.+)\/messages$/);
   if (convMessagesMatch && req.method === 'GET') {
     if (!firestore) {
       sendJSON(res, 503, { error: 'Firestore not configured' });
