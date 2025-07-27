@@ -234,12 +234,12 @@ const server = http.createServer((req, res) => {
   // Webhook endpoint – receives messages from GupShup and associates
   // them with the correct instance. The exact shape of the payload
   // depends on your webhook configuration.
-  // Respond to GET requests on the webhook path so services like
-  // GupShup can validate that the URL is reachable. GupShup performs
-  // a GET request before accepting a webhook URL; without this
-  // handler it receives a 404 and reports "Invalid URL". We simply
-  // return a 200 OK with a basic JSON payload.
-  if (req.method === 'GET' && pathname === '/api/webhook') {
+  // Respond to GET and HEAD requests on the webhook path so services
+  // como GupShup possam validar a URL. O GupShup emite um HEAD antes
+  // de aceitar uma URL; se não tratarmos, retorna 404 e gera erro
+  // “Invalid URL”. Atendemos GET e HEAD com status 200 e um JSON
+  // básico para indicar que o endpoint está online.
+  if ((req.method === 'GET' || req.method === 'HEAD') && pathname === '/api/webhook') {
     sendJSON(res, 200, { status: 'ok' });
     return;
   }
