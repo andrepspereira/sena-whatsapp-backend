@@ -185,10 +185,10 @@ const server = http.createServer((req, res) => {
           // application name before running.
           const params = new URLSearchParams();
           params.append('channel', 'whatsapp');
-          params.append('source', '<SEU_NUMERO_WHATSAPP>');
+          params.append('source', '5521998051860');
           params.append('destination', to);
           params.append('message', JSON.stringify({ type: 'text', text }));
-          params.append('src.name', '<NOME_DA_SUA_APP>');
+          params.append('src.name', 'odontologiadhmed');
           const postBody = params.toString();
 
           const options = {
