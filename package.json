@@ -1,0 +1,12 @@
+{
+  "name": "sena-whatsapp-backend",
+  "version": "1.0.0",
+  "description": "Backend server for WhatsApp panel using Node.js, Firestore integration, and GupShup API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^11.10.1"
+  }
+}
