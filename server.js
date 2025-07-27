@@ -250,9 +250,13 @@ const server = http.createServer((req, res) => {
         sendJSON(res, 400, { error: 'Invalid JSON' });
         return;
       }
+      // Some webhook verification requests may not include instanceId.
+      // In that case we simply return 200 OK so that the provider
+      // considers the endpoint valid. Only when instanceId is present
+      // do we attempt to map the message to an instance.
       const instanceId = data.instanceId;
       if (instanceId === undefined || instanceId === null) {
-        sendJSON(res, 400, { error: 'instanceId missing in webhook payload' });
+        sendJSON(res, 200, { status: 'ok' });
         return;
       }
       const id = parseInt(instanceId, 10);
@@ -261,7 +265,9 @@ const server = http.createServer((req, res) => {
         sendJSON(res, 200, { status: 'received' });
         return;
       }
-      sendJSON(res, 400, { error: 'Invalid instanceId' });
+      // If instanceId is provided but invalid, respond 200 so that
+      // webhook verification does not fail.
+      sendJSON(res, 200, { status: 'ok' });
     });
     return;
   }
