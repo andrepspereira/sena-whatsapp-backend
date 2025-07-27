@@ -35,15 +35,6 @@ const url = require('url');
  */
 
 let firestore = null;
-/*
- * Initialize Firestore.  When running in a managed environment (e.g. Render),
- * the service account credentials should not live on disk.  Instead, we look
- * for a JSON string in the SERVICE_ACCOUNT_KEY environment variable.  The
- * value should be the contents of the service account JSON (not base64).
- * If the environment variable is not set, we fall back to loading the
- * credentials from a local file named serviceAccountKey.json.  This allows
- * local development to continue working without additional configuration.
- */
 try {
   const admin = require('firebase-admin');
   let serviceAccount;
@@ -55,7 +46,6 @@ try {
       throw parseErr;
     }
   } else {
-    // eslint-disable-next-line global-require, import/no-dynamic-require
     serviceAccount = require('./serviceAccountKey.json');
   }
   admin.initializeApp({
@@ -93,7 +83,6 @@ function parseRequestBody(req, callback) {
   let body = '';
   req.on('data', chunk => {
     body += chunk;
-    // Protect against extremely large payloads
     if (body.length > 1e6) req.connection.destroy();
   });
   req.on('end', () => {
@@ -160,7 +149,6 @@ const server = http.createServer((req, res) => {
         sendJSON(res, 200, instances[id].messages);
         return;
       } else if (req.method === 'POST') {
-        // Handle sending a message
         parseRequestBody(req, (err, data) => {
           if (err) {
             sendJSON(res, 400, { error: 'Invalid JSON' });
@@ -179,13 +167,6 @@ const server = http.createServer((req, res) => {
             return;
           }
 
-          // Build the body for WA API: form‑urlencoded with channel, source,
-          // destination, message JSON string and src.name (app name).
-          // The WhatsApp source number and application name are read from
-          // environment variables so they can be configured without
-          // hard‑coding sensitive data.  For local development you can
-          // optionally set GSWHATSAPP_NUMBER and GSAPP_NAME in a .env file
-          // or your deployment environment (e.g., Render dashboard).
           const params = new URLSearchParams();
           params.append('channel', 'whatsapp');
           const srcNumber = process.env.GSWHATSAPP_NUMBER || '<SEU_NUMERO_WHATSAPP>';
@@ -222,11 +203,8 @@ const server = http.createServer((req, res) => {
           apiReq.write(postBody);
           apiReq.end();
 
-          // Store locally so the UI can display the message immediately
           inst.messages.push({ from: 'me', to, text });
 
-          // Persist outgoing message to Firestore if configured. This allows
-          // the history to survive server restarts and be shown in the panel.
           if (firestore) {
             firestore.collection('mensagens').add({
               hora: Date.now().toString(),
@@ -249,13 +227,7 @@ const server = http.createServer((req, res) => {
   }
 
   // Webhook endpoint – receives messages from GupShup and associates
-  // them with the correct instance. The exact shape of the payload
-  // depends on your webhook configuration.
-  // Respond to GET and HEAD requests on the webhook path so services
-  // como GupShup possam validar a URL. O GupShup emite um HEAD antes
-  // de aceitar uma URL; se não tratarmos, retorna 404 e gera erro
-  // “Invalid URL”. Atendemos GET e HEAD com status 200 e um JSON
-  // básico para indicar que o endpoint está online.
+  // them with the correct instance.
   if ((req.method === 'GET' || req.method === 'HEAD') && pathname === '/api/webhook') {
     sendJSON(res, 200, { status: 'ok' });
     return;
@@ -268,9 +240,7 @@ const server = http.createServer((req, res) => {
         return;
       }
       const instanceId = data.instanceId;
-      // If no instanceId is supplied, treat it as a generic incoming message
       if (instanceId === undefined || instanceId === null) {
-      // Persist incoming message as a generic record
         if (firestore) {
           try {
             const numeroPaciente = data.numeroPaciente || data.sender || data.source || '';
@@ -296,7 +266,6 @@ const server = http.createServer((req, res) => {
       const id = parseInt(instanceId, 10);
       if (id >= 0 && id < INSTANCE_COUNT) {
         instances[id].messages.push(data);
-        // Persist incoming message assigned to a specific instance
         if (firestore) {
           try {
             const numeroPaciente = data.numeroPaciente || data.sender || data.source || '';
@@ -319,8 +288,6 @@ const server = http.createServer((req, res) => {
         sendJSON(res, 200, { status: 'received' });
         return;
       }
-      // If instanceId is provided but invalid, respond 200 so that
-      // webhook verification does not fail.
       sendJSON(res, 200, { status: 'ok' });
     });
     return;
@@ -328,25 +295,12 @@ const server = http.createServer((req, res) => {
 
   /*
    * Firestore conversation APIs
-   *
-   * These endpoints expose basic CRUD operations for conversations and
-   * messages stored in Firestore. They will only work if Firestore
-   * initialization was successful.
    */
-
-  // GET /api/conversations – list all conversation documents with minimal info
   if (req.method === 'GET' && pathname === '/api/conversations') {
     if (!firestore) {
       sendJSON(res, 503, { error: 'Firestore not configured' });
       return;
     }
-    // List conversations by grouping messages on numeroPaciente. We
-    // iterate over all message documents and build a map keyed by
-    // numeroPaciente. Each entry stores the nomePaciente and the most
-    // recent hora. This way we can produce a list of active
-    // conversations even if Firestore doesn't use subcollections for
-    // messages. Note: this fetches all documents in the collection,
-    // which is acceptable for small/moderate datasets.
     firestore.collection('mensagens').get().then(snapshot => {
       const convMap = {};
       snapshot.forEach(doc => {
@@ -364,7 +318,6 @@ const server = http.createServer((req, res) => {
             lastHora: horaStr || ''
           };
         } else {
-          // update lastHora if this message is newer
           const existing = convMap[numPac];
           const prev = existing.lastHora || '';
           if (horaStr && horaStr > prev) {
@@ -373,7 +326,6 @@ const server = http.createServer((req, res) => {
         }
       });
       const convs = Object.values(convMap);
-      // Sort conversations by lastHora descending (most recent first)
       convs.sort((a, b) => (b.lastHora || '').localeCompare(a.lastHora || ''));
       sendJSON(res, 200, convs);
     }).catch(err => {
@@ -383,7 +335,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // GET /api/conversation/:id/messages – list messages for a conversation
+  // GET /api/conversation/:id/messages
   const convMessagesMatch = pathname.match(/^\/api\/conversation\/(.+)\/messages$/);
   if (convMessagesMatch && req.method === 'GET') {
     if (!firestore) {
@@ -391,19 +343,12 @@ const server = http.createServer((req, res) => {
       return;
     }
     const convId = convMessagesMatch[1];
-    // Retrieve all messages for a conversation from Firestore. We avoid
-    // ordering at the query level because subcollection queries with
-    // orderBy may require composite indexes and could silently fail
-    // when fields are missing. Instead, fetch all documents and sort
-    // them in memory by the 'hora' field (as a string).
-    // Gather all messages where numeroPaciente equals the conversation ID.
     firestore.collection('mensagens').where('numeroPaciente', '==', convId).get()
       .then(snapshot => {
         const messages = [];
         snapshot.forEach(doc => {
           messages.push({ id: doc.id, ...doc.data() });
         });
-        // Sort messages by 'hora' ascending
         messages.sort((a, b) => {
           const ha = (a.hora || '').toString();
           const hb = (b.hora || '').toString();
@@ -418,7 +363,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // POST /api/conversation – create a new conversation and first message
+  // POST /api/conversation
   if (pathname === '/api/conversation' && req.method === 'POST') {
     if (!firestore) {
       sendJSON(res, 503, { error: 'Firestore not configured' });
@@ -436,19 +381,12 @@ const server = http.createServer((req, res) => {
         sendJSON(res, 400, { error: 'numeroPaciente, nomePaciente and texto are required' });
         return;
       }
-      // Create conversation document
-      // Create a conversation marker (document) and insert the first
-      // message into the top‑level collection as well. This enables
-      // conversations to be listed by numeroPaciente without relying on
-      // subcollections.
       firestore.collection('mensagens').add({
         criadoEm: new Date().toISOString(),
         numeroPaciente,
         nomePaciente
       }).then(convRef => {
         const convId = convRef.id;
-        // Write the first message to the top‑level collection. We use
-        // numeroPaciente to group messages logically.
         return firestore.collection('mensagens').add({
           hora: Date.now().toString(),
           mensagemPaciente: null,
@@ -468,8 +406,8 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // PUT /api/conversation/:id/status – update status of conversation
-  const convStatusMatch = pathname.match(/^\/api/conversation/(.+)/status$/);
+  // PUT /api/conversation/:id/status
+  const convStatusMatch = pathname.match(/^\/api\/conversation\/(.+)\/status$/);
   if (convStatusMatch && req.method === 'PUT') {
     if (!firestore) {
       sendJSON(res, 503, { error: 'Firestore not configured' });
@@ -498,13 +436,11 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Default 404 for unknown routes
+  // Default 404
   sendJSON(res, 404, { error: 'Not found' });
 });
 
-// Change this value if you need to expose the server on a different port
-// Use the PORT provided by the environment when deployed (e.g., on Render)
-// fallback to 5001 for local development.
+// Use environment PORT or fallback to 5001
 const PORT = process.env.PORT || 5001;
 server.listen(PORT, () => {
   console.log(`Back‑end server listening on port ${PORT}`);
