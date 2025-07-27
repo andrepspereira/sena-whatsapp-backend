@@ -224,6 +224,23 @@ const server = http.createServer((req, res) => {
 
           // Store locally so the UI can display the message immediately
           inst.messages.push({ from: 'me', to, text });
+
+          // Persist outgoing message to Firestore if configured. This allows
+          // the history to survive server restarts and be shown in the panel.
+          if (firestore) {
+            firestore.collection('mensagens').add({
+              hora: Date.now().toString(),
+              mensagemPaciente: null,
+              nomePaciente: '',
+              numeroPaciente: to,
+              remetente: srcNumber,
+              respostaRobo: text,
+              statusAtendimento: 'em atendimento humano'
+            }).catch(err => {
+              console.error('Error saving outgoing message:', err);
+            });
+          }
+
           sendJSON(res, 200, { status: 'sent' });
         });
         return;
@@ -250,18 +267,55 @@ const server = http.createServer((req, res) => {
         sendJSON(res, 400, { error: 'Invalid JSON' });
         return;
       }
-      // Some webhook verification requests may not include instanceId.
-      // In that case we simply return 200 OK so that the provider
-      // considers the endpoint valid. Only when instanceId is present
-      // do we attempt to map the message to an instance.
       const instanceId = data.instanceId;
+      // If no instanceId is supplied, treat it as a generic incoming message
       if (instanceId === undefined || instanceId === null) {
+      // Persist incoming message as a generic record
+        if (firestore) {
+          try {
+            const numeroPaciente = data.numeroPaciente || data.sender || data.source || '';
+            const mensagem = data.mensagemPaciente || data.message || data.text || JSON.stringify(data);
+            firestore.collection('mensagens').add({
+              hora: Date.now().toString(),
+              mensagemPaciente: mensagem,
+              nomePaciente: '',
+              numeroPaciente: numeroPaciente,
+              remetente: numeroPaciente,
+              respostaRobo: null,
+              statusAtendimento: ''
+            }).catch(err => {
+              console.error('Error saving incoming message without instanceId:', err);
+            });
+          } catch (err) {
+            console.error('Error processing incoming webhook without instanceId:', err);
+          }
+        }
         sendJSON(res, 200, { status: 'ok' });
         return;
       }
       const id = parseInt(instanceId, 10);
       if (id >= 0 && id < INSTANCE_COUNT) {
         instances[id].messages.push(data);
+        // Persist incoming message assigned to a specific instance
+        if (firestore) {
+          try {
+            const numeroPaciente = data.numeroPaciente || data.sender || data.source || '';
+            const mensagem = data.mensagemPaciente || data.message || data.text || JSON.stringify(data);
+            firestore.collection('mensagens').add({
+              hora: Date.now().toString(),
+              mensagemPaciente: mensagem,
+              nomePaciente: '',
+              numeroPaciente: numeroPaciente,
+              remetente: numeroPaciente,
+              respostaRobo: null,
+              statusAtendimento: ''
+            }).catch(err => {
+              console.error('Error saving incoming message for instance:', err);
+            });
+          } catch (err) {
+            console.error('Error processing incoming webhook for instance:', err);
+          }
+        }
         sendJSON(res, 200, { status: 'received' });
         return;
       }
@@ -296,10 +350,10 @@ const server = http.createServer((req, res) => {
     firestore.collection('mensagens').get().then(snapshot => {
       const convMap = {};
       snapshot.forEach(doc => {
-        const data = doc.data();
-        const numPac = data.numeroPaciente;
-        const nomePac = data.nomePaciente;
-        const horaStr = data.hora;
+        const dataDoc = doc.data();
+        const numPac = dataDoc.numeroPaciente;
+        const nomePac = dataDoc.nomePaciente;
+        const horaStr = dataDoc.hora;
         if (!numPac) {
           return;
         }
@@ -330,7 +384,7 @@ const server = http.createServer((req, res) => {
   }
 
   // GET /api/conversation/:id/messages – list messages for a conversation
-  const convMessagesMatch = pathname.match(/^\/api\/conversation\/(.+)\/messages$/);
+  const convMessagesMatch = pathname.match(/^\/api/conversation/(.+)/messages$/);
   if (convMessagesMatch && req.method === 'GET') {
     if (!firestore) {
       sendJSON(res, 503, { error: 'Firestore not configured' });
@@ -415,7 +469,7 @@ const server = http.createServer((req, res) => {
   }
 
   // PUT /api/conversation/:id/status – update status of conversation
-  const convStatusMatch = pathname.match(/^\/api\/conversation\/(.+)\/status$/);
+  const convStatusMatch = pathname.match(/^\/api/conversation/(.+)/status$/);
   if (convStatusMatch && req.method === 'PUT') {
     if (!firestore) {
       sendJSON(res, 503, { error: 'Firestore not configured' });
@@ -444,7 +498,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-// Default 404 for unknown routes
+  // Default 404 for unknown routes
   sendJSON(res, 404, { error: 'Not found' });
 });
 
