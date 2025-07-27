@@ -122,23 +122,23 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Set token for an instance
-  const tokenMatch = pathname.match(/^\/api\/instance\/(\d+)\/token$/);
-  if (req.method === 'POST' && tokenMatch) {
-    const id = parseInt(tokenMatch[1], 10);
-    if (id >= 0 && id < INSTANCE_COUNT) {
-      parseRequestBody(req, (err, data) => {
-        if (err) {
-          sendJSON(res, 400, { error: 'Invalid JSON' });
-          return;
-        }
-        const token = (data && data.token && data.token.trim()) || null;
-        instances[id].token = token;
-        sendJSON(res, 200, { id, connected: !!token });
-      });
-      return;
-    }
+ // Set token for an instance
+const tokenMatch = pathname.match(/^\/api\/instance\/(\d+)\/token$/);
+if (req.method === 'POST' && tokenMatch) {
+  const id = parseInt(tokenMatch[1], 10);
+  if (id >= 0 && id < INSTANCE_COUNT) {
+    parseRequestBody(req, (err, data) => {
+      if (err) {
+        sendJSON(res, 400, { error: 'Invalid JSON' });
+        return;
+      }
+      const token = (data && data.token && data.token.trim()) || null;
+      instances[id].token = token;
+      sendJSON(res, 200, { id, connected: !!token });
+    });
+    return;
   }
+}
 
   // Messages endpoints
   const messagesMatch = pathname.match(/^\/api\/instance\/(\d+)\/messages$/);
