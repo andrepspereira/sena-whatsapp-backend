@@ -117,8 +117,9 @@ app.post('/api/instance/:id/token', jsonParser, async (req, res) => {
  */
 app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
   const instanceId = req.params.id;
-  const { numeroPaciente, texto } = req.body;
-  if (!numeroPaciente || !texto) {
+  const { numeroPaciente, numero_paciente, texto } = req.body;
+  const phone = numeroPaciente || numero_paciente;
+  if (!phone || !texto) {
     return res.status(400).json({ error: 'numeroPaciente and texto are required' });
   }
   const token = instanceTokens[instanceId];
@@ -131,7 +132,7 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
       params: {
         channel: 'whatsapp',
         source: process.env.GSWHATSAPP_NUMBER,
-        destination: numeroPaciente,
+        destination: phone,
         message: texto,
         'src.name': process.env.GSAPP_NAME
       },
@@ -141,12 +142,12 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
     // Record the message in Supabase
     await supabase.from('messages').insert({
       instance_id: String(instanceId),
-      numero_paciente: numeroPaciente,
-      mensagem_paciente: texto,
+      numero_paciente: phone,
+      mensagem_paciente: null,
       resposta_robo: null,
-      resposta_atendente: null,
-      remetente: 'Robô',
-      status_atendimento: 'PENDENTE'
+      resposta_atendente: texto,
+      remetente: 'Atendente',
+      status_atendimento: 'EM_ATENDIMENTO'
     });
 
     return res.json({ success: true });
@@ -230,10 +231,21 @@ app.get('/api/conversations', async (req, res) => {
     data.forEach((msg) => {
       const key = msg.numero_paciente;
       if (!convoMap[key]) {
+        // Determine the status based on the most recent message.  If
+        // status_atendimento is explicitly set, use it; otherwise infer
+        // from the remetente: paciente -> PENDENTE, Robô ou Atendente -> EM_ATENDIMENTO.
+        let status;
+        if (msg.status_atendimento) {
+          status = msg.status_atendimento;
+        } else {
+          if (msg.remetente === 'Paciente') status = 'PENDENTE';
+          else if (msg.remetente === 'Robô' || msg.remetente === 'Atendente') status = 'EM_ATENDIMENTO';
+          else status = 'PENDENTE';
+        }
         convoMap[key] = {
           numeroPaciente: msg.numero_paciente,
           lastMessage: msg.mensagem_paciente || msg.resposta_robo,
-          statusAtendimento: msg.status_atendimento,
+          statusAtendimento: status,
           updatedAt: msg.updated_at
         };
       }
