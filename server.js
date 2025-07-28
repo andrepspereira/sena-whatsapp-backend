@@ -283,6 +283,31 @@ app.get('/', (req, res) => {
   res.send('API is up and running');
 });
 
+/**
+ * PATCH /api/conversation/:numero/status
+ * Atualiza o status de atendimento de todas as mensagens de uma conversa.  Útil
+ * para marcar uma conversa como FINALIZADO ou EM_ATENDIMENTO a partir do
+ * painel.  O corpo deve conter `{ statusAtendimento: '<novo_status>' }`.
+ */
+app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
+  const numero = req.params.numero;
+  const { statusAtendimento } = req.body;
+  if (!statusAtendimento) {
+    return res.status(400).json({ error: 'statusAtendimento is required' });
+  }
+  try {
+    const { error } = await supabase
+      .from('messages')
+      .update({ status_atendimento: statusAtendimento })
+      .eq('numero_paciente', numero);
+    if (error) throw error;
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Failed to update status:', err.message);
+    return res.status(500).json({ error: 'Failed to update status' });
+  }
+});
+
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
