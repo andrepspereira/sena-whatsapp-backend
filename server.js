@@ -246,7 +246,8 @@ app.get('/api/conversations', async (req, res) => {
           numeroPaciente: msg.numero_paciente,
           lastMessage: msg.mensagem_paciente || msg.resposta_robo,
           statusAtendimento: status,
-          updatedAt: msg.updated_at
+          updatedAt: msg.updated_at,
+          instanceId: msg.instance_id
         };
       }
     });
