@@ -175,15 +175,32 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
       return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
     }
 
+    // Always record the patient's message as a separate record
     await supabase.from('messages').insert({
       instance_id: String(instanceId),
       numero_paciente: numeroPaciente,
       mensagem_paciente: mensagemPaciente,
-      resposta_robo: respostaRobo,
+      resposta_robo: null,
       resposta_atendente: null,
-      remetente,
+      remetente: 'Paciente',
       status_atendimento: 'PENDENTE'
     });
+
+    // If there is a robot response included in the payload, insert it as
+    // another row.  This ensures that questions and respostas are stored
+    // separately and can be rendered independently in the panel.  The
+    // remitente is set to 'Robô' to allow proper styling on the client.
+    if (respostaRobo) {
+      await supabase.from('messages').insert({
+        instance_id: String(instanceId),
+        numero_paciente: numeroPaciente,
+        mensagem_paciente: null,
+        resposta_robo: respostaRobo,
+        resposta_atendente: null,
+        remetente: 'Robô',
+        status_atendimento: 'PENDENTE'
+      });
+    }
 
     return res.json({ received: true });
   } catch (err) {
