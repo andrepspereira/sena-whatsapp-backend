@@ -345,6 +345,32 @@ app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
   }
 });
 
+/**
+ * PATCH /api/conversation/:numero/name
+ * Atualiza o nome do paciente para todas as mensagens de uma conversa.  Permite
+ * que um atendente associe um nome a um número existente quando ele é
+ * desconhecido ou para corrigir erros.  O corpo deve conter
+ * `{ nomePaciente: '<novo_nome>' }`.
+ */
+app.patch('/api/conversation/:numero/name', jsonParser, async (req, res) => {
+  const numero = req.params.numero;
+  const { nomePaciente } = req.body;
+  if (!nomePaciente) {
+    return res.status(400).json({ error: 'nomePaciente is required' });
+  }
+  try {
+    const { error } = await supabase
+      .from('messages')
+      .update({ nome_paciente: nomePaciente })
+      .eq('numero_paciente', numero);
+    if (error) throw error;
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Failed to update name:', err.message);
+    return res.status(500).json({ error: 'Failed to update name' });
+  }
+});
+
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
