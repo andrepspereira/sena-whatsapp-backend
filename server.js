@@ -123,23 +123,31 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
     return res.status(400).json({ error: 'numeroPaciente and texto are required' });
   }
   const token = instanceTokens[instanceId];
-  if (!token) {
-    return res.status(400).json({ error: 'Instance token not found' });
-  }
   try {
-    // Send the message via Gupshup
-    await axios.post('https://api.gupshup.io/wa/api/v1/msg', null, {
-      params: {
-        channel: 'whatsapp',
-        source: process.env.GSWHATSAPP_NUMBER,
-        destination: phone,
-        message: texto,
-        'src.name': process.env.GSAPP_NAME
-      },
-      headers: { apikey: token }
-    });
+    // Tenta enviar a mensagem via Gupshup somente se houver token configurado.
+    // Mesmo que a chamada falhe ou não exista token, continuamos gravando a
+    // mensagem no banco para que apareça no painel.  Isso permite ao
+    // atendente responder mesmo que a API do Gupshup esteja indisponível
+    // ou a instância ainda não tenha um token cadastrado.
+    if (token) {
+      try {
+        await axios.post('https://api.gupshup.io/wa/api/v1/msg', null, {
+          params: {
+            channel: 'whatsapp',
+            source: process.env.GSWHATSAPP_NUMBER,
+            destination: phone,
+            message: texto,
+            'src.name': process.env.GSAPP_NAME
+          },
+          headers: { apikey: token }
+        });
+      } catch (err) {
+        console.error('Failed to send message via Gupshup:', err.message);
+      }
+    }
 
-    // Record the message in Supabase
+    // Sempre grava a mensagem no Supabase para refletir no histórico. O
+    // remetente é "Atendente" e o status é marcado como em atendimento.
     await supabase.from('messages').insert({
       instance_id: String(instanceId),
       numero_paciente: phone,
