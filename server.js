@@ -117,8 +117,12 @@ app.post('/api/instance/:id/token', jsonParser, async (req, res) => {
  */
 app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
   const instanceId = req.params.id;
-  const { numeroPaciente, numero_paciente, texto } = req.body;
+  const { numeroPaciente, numero_paciente, nomePaciente, nome_paciente, texto } = req.body;
   const phone = numeroPaciente || numero_paciente;
+  // Optional patient name provided by the front‑end or Make.  If present
+  // this will be stored on every message for this conversation so that
+  // the UI can display the patient’s name instead of just the number.
+  const patientName = nomePaciente || nome_paciente || null;
   if (!phone || !texto) {
     return res.status(400).json({ error: 'numeroPaciente and texto are required' });
   }
@@ -151,6 +155,7 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
     await supabase.from('messages').insert({
       instance_id: String(instanceId),
       numero_paciente: phone,
+      nome_paciente: patientName,
       mensagem_paciente: null,
       resposta_robo: null,
       resposta_atendente: texto,
@@ -179,6 +184,7 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
     const mensagemPaciente = body.mensagemPaciente;
     const respostaRobo = body.respostaRobo || null;
     const remetente = body.remetente || 'Paciente';
+    const patientName = body.nomePaciente || body.nome_paciente || null;
 
     if (!numeroPaciente || !mensagemPaciente) {
       return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
@@ -188,6 +194,7 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
     await supabase.from('messages').insert({
       instance_id: String(instanceId),
       numero_paciente: numeroPaciente,
+      nome_paciente: patientName,
       mensagem_paciente: mensagemPaciente,
       resposta_robo: null,
       resposta_atendente: null,
@@ -200,15 +207,35 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
     // separately and can be rendered independently in the panel.  The
     // remitente is set to 'Robô' to allow proper styling on the client.
     if (respostaRobo) {
+      // Insere a resposta do robô como uma mensagem separada.  Definimos
+      // status_atendimento como 'EM_ATENDIMENTO' para indicar que o
+      // atendimento está em progresso (não pendente).  Caso a frase
+      // indique transferência, o status será atualizado para 'PENDENTE'
+      // logo abaixo.
       await supabase.from('messages').insert({
         instance_id: String(instanceId),
         numero_paciente: numeroPaciente,
+        nome_paciente: patientName,
         mensagem_paciente: null,
         resposta_robo: respostaRobo,
         resposta_atendente: null,
         remetente: 'Robô',
-        status_atendimento: 'PENDENTE'
+        status_atendimento: 'EM_ATENDIMENTO'
       });
+      // Se a resposta do robô contiver a expressão de transferência, marque a conversa
+      // como pendente para que o painel indique que precisa de atendente humano.  Use
+      // includes() em vez de igualdade para suportar variações de frase ou emojis.
+      const transferKey = 'transferir para um atendente humano';
+      if (respostaRobo && respostaRobo.toLowerCase().includes(transferKey)) {
+        try {
+          await supabase
+            .from('messages')
+            .update({ status_atendimento: 'PENDENTE' })
+            .eq('numero_paciente', numeroPaciente);
+        } catch (err) {
+          console.error('Failed to update status after transfer phrase:', err.message);
+        }
+      }
     }
 
     return res.json({ received: true });
@@ -252,8 +279,10 @@ app.get('/api/conversations', async (req, res) => {
         }
         convoMap[key] = {
           numeroPaciente: msg.numero_paciente,
-          lastMessage: msg.mensagem_paciente || msg.resposta_robo,
+          nomePaciente: msg.nome_paciente || null,
+          lastMessage: msg.mensagem_paciente || msg.resposta_robo || msg.resposta_atendente,
           statusAtendimento: status,
+          lastRemetente: msg.remetente,
           updatedAt: msg.updated_at,
           instanceId: msg.instance_id
         };
