@@ -223,17 +223,24 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
         status_atendimento: 'EM_ATENDIMENTO'
       });
       // Se a resposta do robô contiver a expressão de transferência, marque a conversa
-      // como pendente para que o painel indique que precisa de atendente humano.  Use
-      // includes() em vez de igualdade para suportar variações de frase ou emojis.
-      const transferKey = 'transferir para um atendente humano';
-      if (respostaRobo && respostaRobo.toLowerCase().includes(transferKey)) {
-        try {
-          await supabase
-            .from('messages')
-            .update({ status_atendimento: 'PENDENTE' })
-            .eq('numero_paciente', numeroPaciente);
-        } catch (err) {
-          console.error('Failed to update status after transfer phrase:', err.message);
+      // como pendente para que o painel indique que precisa de atendente humano.
+      // Fazemos uma verificação insensível a maiúsculas e a acentos para capturar
+      // variações de texto (ex.: "Vou te transferir para um atendente humano.").
+      if (respostaRobo) {
+        const normalized = respostaRobo
+          .toLowerCase()
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '');
+        const transferKey = 'transferir para um atendente humano';
+        if (normalized.includes(transferKey)) {
+          try {
+            await supabase
+              .from('messages')
+              .update({ status_atendimento: 'PENDENTE' })
+              .eq('numero_paciente', numeroPaciente);
+          } catch (err) {
+            console.error('Failed to update status after transfer phrase:', err.message);
+          }
         }
       }
     }
