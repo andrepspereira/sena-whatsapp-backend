@@ -3,14 +3,14 @@ const bodyParser = require('body-parser');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
-// A refined version of the SENA backend that attempts to align the
-// conversation status badges in the front‑end with the underlying
-// `statusAtendimento` values.  In previous versions, the panel
-// displayed “ROBÔ” or “HUMANO” based solely no `lastRemetente`,
-// ignorando o campo `statusAtendimento`.  Aqui garantimos que
-// `lastRemetente` seja coerente com o status da conversa quando este
-// status for PENDENTE ou FINALIZADO, para que a interface mostre os
-// selos corretos sem alteração no front‑end.
+// Versão 4 do servidor SENA. Além de normalizar o texto da resposta do robô e
+// corrigir a exibição de status na lista de conversas, esta versão
+// desativa o robô após uma transferência para atendente humano.  Se a
+// conversa estiver com status PENDENTE ou FINALIZADO, qualquer
+// `respostaRobo` recebida será ignorada (não inserida nem enviada ao
+// paciente).  Também adiciona um campo `online` no endpoint
+// `/api/instances` para que o painel saiba se uma instância possui
+// token ativo.
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
@@ -58,10 +58,24 @@ function normaliseString(str) {
     .replace(/[.!?]/g, '');
 }
 
+// Helper to get the current status of a conversation
+async function getCurrentStatus(numeroPaciente) {
+  const { data, error } = await supabase
+    .from('messages')
+    .select('status_atendimento')
+    .eq('numero_paciente', numeroPaciente)
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (error || !data || data.length === 0) return null;
+  return data[0].status_atendimento;
+}
+
 app.get('/api/instances', async (req, res) => {
   const count = Number(process.env.INSTANCE_COUNT || 8);
   const list = [];
-  for (let i = 0; i < count; i++) list.push({ id: String(i), hasToken: !!instanceTokens[i] });
+  for (let i = 0; i < count; i++) {
+    list.push({ id: String(i), hasToken: !!instanceTokens[i], online: !!instanceTokens[i] });
+  }
   return res.json(list);
 });
 
@@ -118,6 +132,7 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
     const respostaRobo = body.respostaRobo || null;
     const patientName = body.nomePaciente || body.nome_paciente || null;
     if (!numeroPaciente || !mensagemPaciente) return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
+    // Always record the patient's message
     await supabase.from('messages').insert({
       instance_id: String(instanceId),
       numero_paciente: numeroPaciente,
@@ -128,7 +143,16 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
       remetente: 'Paciente',
       status_atendimento: 'PENDENTE',
     });
+    // Before recording the robot response, check current status.  If
+    // status is PENDENTE or FINALIZADO, we should ignore the robot
+    // response to prevent reactivating the bot.
     if (respostaRobo) {
+      const currentStatus = await getCurrentStatus(numeroPaciente);
+      if (currentStatus === 'PENDENTE' || currentStatus === 'FINALIZADO') {
+        // Skip inserting robot response entirely to prevent bot reactivation
+        return res.json({ received: true, ignored: true });
+      }
+      // Otherwise insert the robot response
       await supabase.from('messages').insert({
         instance_id: String(instanceId),
         numero_paciente: numeroPaciente,
@@ -168,9 +192,7 @@ app.get('/api/conversations', async (req, res) => {
           const normalized = normaliseString(msg.resposta_robo);
           if (normalized.includes('transferir para um atendente humano')) status = 'PENDENTE';
         }
-        // Derive a lastRemetente that matches the status so the panel
-        // shows the appropriate badge.  If the status is PENDENTE,
-        // use 'Paciente'; if FINALIZADO, use 'Finalizado'.
+        // Derive lastRemetente consistent with status
         let lastRemetente = msg.remetente;
         if (status === 'PENDENTE') lastRemetente = 'Paciente';
         else if (status === 'FINALIZADO') lastRemetente = 'Finalizado';
