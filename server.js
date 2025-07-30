@@ -3,13 +3,17 @@ const bodyParser = require('body-parser');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
-// Versão 7 do servidor SENA.  Nesta versão, o robô é desativado não
-// apenas quando uma conversa está PENDENTE, mas também quando o
-// último remetente foi um atendente humano.  Isso impede que o
-// assistente automático responda e altere o status enquanto um
-// atendente estiver conversando, mesmo que a interação tenha sido
-// iniciada pelo painel.  Outras funcionalidades das versões
-// anteriores permanecem.
+// Versão 8 do servidor SENA.
+// Nesta versão refinamos o comportamento do robô e do status para
+// alinhá‑lo ao fluxo descrito pelo usuário:
+//  - Quando um atendente humano inicia uma conversa via painel e o paciente
+//    responde, o status deve permanecer "PENDENTE" e o robô não deve
+//    enviar respostas.  Para isso, determinamos o status da mensagem do
+//    paciente com base no status e remetente da última mensagem.
+//  - Tokens de instâncias são carregados a cada solicitação via Supabase,
+//    garantindo que as instâncias permaneçam "online" mesmo após reloads.
+//  - Demais rotas de mensagens e webhooks preservam a funcionalidade das
+//    versões anteriores.
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
@@ -19,6 +23,7 @@ const app = express();
 const jsonParser = bodyParser.json();
 const urlencodedParser = bodyParser.urlencoded({ extended: true });
 
+// Middleware CORS
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
@@ -27,29 +32,7 @@ app.use((req, res, next) => {
   next();
 });
 
-const instanceTokens = {};
-
-async function upsertInstance(id, token) {
-  const updates = {
-    id_da_instancia: String(id),
-    token: token ?? null,
-    status: 'active',
-    updated_at: new Date().toISOString(),
-  };
-  await supabase.from('instances').upsert(updates, { onConflict: 'id_da_instancia' });
-  if (token) instanceTokens[id] = token;
-}
-
-// Preload tokens
-(async () => {
-  const { data } = await supabase.from('instances').select('id_da_instancia, token');
-  if (data) {
-    data.forEach((row) => {
-      if (row.token) instanceTokens[row.id_da_instancia] = row.token;
-    });
-  }
-})();
-
+// Helpers para normalizar e verificar a última mensagem
 function normaliseString(str) {
   return str
     .toLowerCase()
@@ -69,41 +52,65 @@ async function getLastMessageInfo(numeroPaciente) {
   return data[0];
 }
 
-async function getCurrentStatus(numeroPaciente) {
-  const { data } = await supabase
-    .from('messages')
-    .select('status_atendimento')
-    .eq('numero_paciente', numeroPaciente)
-    .order('created_at', { ascending: false })
-    .limit(1);
-  if (!data || data.length === 0) return null;
-  return data[0].status_atendimento;
-}
-
-app.get('/api/instances', (req, res) => {
+// Rota para listar instâncias. Busca as instâncias diretamente do Supabase
+// para refletir o estado atualizado dos tokens, evitando que a "instância"
+// pareça desconectada quando o painel é recarregado.
+app.get('/api/instances', async (req, res) => {
   const count = Number(process.env.INSTANCE_COUNT || 8);
   const list = [];
-  for (let i = 0; i < count; i++) {
-    list.push({ id: String(i), hasToken: !!instanceTokens[i], online: !!instanceTokens[i] });
+  try {
+    const { data } = await supabase.from('instances').select('id_da_instancia, token');
+    for (let i = 0; i < count; i++) {
+      // Procura a instância no supabase; se encontrar e possuir token, está online
+      const row = data && data.find((r) => r.id_da_instancia === String(i));
+      const hasToken = row && row.token;
+      list.push({ id: String(i), hasToken: !!hasToken, online: !!hasToken });
+    }
+    return res.json(list);
+  } catch (err) {
+    console.error('Failed to fetch instances:', err.message);
+    // Em caso de erro, retorna lista vazia com offline
+    for (let i = 0; i < count; i++) list.push({ id: String(i), hasToken: false, online: false });
+    return res.json(list);
   }
-  return res.json(list);
 });
 
+// Rota para salvar token de instância
 app.post('/api/instance/:id/token', jsonParser, async (req, res) => {
   const instanceId = req.params.id;
   const { token } = req.body;
   if (!token) return res.status(400).json({ error: 'Token is required' });
-  await upsertInstance(instanceId, token);
-  return res.json({ success: true });
+  // Upsert no Supabase
+  const updates = {
+    id_da_instancia: String(instanceId),
+    token: token,
+    status: 'active',
+    updated_at: new Date().toISOString(),
+  };
+  try {
+    await supabase.from('instances').upsert(updates, { onConflict: 'id_da_instancia' });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Failed to upsert token:', err.message);
+    return res.status(500).json({ error: 'Failed to save token' });
+  }
 });
 
+// Envio de mensagem do atendente humano
 app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
   const instanceId = req.params.id;
   const { numeroPaciente, numero_paciente, nomePaciente, nome_paciente, texto } = req.body;
   const phone = numeroPaciente || numero_paciente;
   const patientName = nomePaciente || nome_paciente || null;
   if (!phone || !texto) return res.status(400).json({ error: 'numeroPaciente and texto are required' });
-  const token = instanceTokens[instanceId];
+  // Obter token atual do Supabase para garantir que a instância está online
+  let token;
+  try {
+    const { data } = await supabase.from('instances').select('token').eq('id_da_instancia', String(instanceId)).single();
+    token = data ? data.token : null;
+  } catch {
+    token = null;
+  }
   if (token) {
     try {
       await axios.post('https://api.gupshup.io/wa/api/v1/msg', null, {
@@ -120,19 +127,26 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
       console.error('Failed to send message via Gupshup:', err.message);
     }
   }
-  await supabase.from('messages').insert({
-    instance_id: String(instanceId),
-    numero_paciente: phone,
-    nome_paciente: patientName,
-    mensagem_paciente: null,
-    resposta_robo: null,
-    resposta_atendente: texto,
-    remetente: 'Atendente',
-    status_atendimento: 'EM_ATENDIMENTO',
-  });
-  return res.json({ success: true });
+  // Insere a mensagem do atendente
+  try {
+    await supabase.from('messages').insert({
+      instance_id: String(instanceId),
+      numero_paciente: phone,
+      nome_paciente: patientName,
+      mensagem_paciente: null,
+      resposta_robo: null,
+      resposta_atendente: texto,
+      remetente: 'Atendente',
+      status_atendimento: 'EM_ATENDIMENTO',
+    });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Failed to insert attendant message:', err.message);
+    return res.status(500).json({ error: 'Failed to save message' });
+  }
 });
 
+// Webhook para mensagens de pacientes e respostas do robô
 app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
   try {
     const body = req.body || {};
@@ -142,13 +156,21 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
     const respostaRobo = body.respostaRobo || null;
     const patientName = body.nomePaciente || body.nome_paciente || null;
     if (!numeroPaciente || !mensagemPaciente) return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
-    // Fetch the last message info (status and remetente)
+    // Pega última informação (status e remetente)
     const lastInfo = await getLastMessageInfo(numeroPaciente);
     const lastStatus = lastInfo.status_atendimento;
     const lastRemetente = lastInfo.remetente;
-    // Determine status for the patient message
-    const patientStatus = lastStatus === 'PENDENTE' ? 'PENDENTE' : 'EM_ATENDIMENTO';
-    // Insert the patient's message
+    // Determina status da mensagem do paciente:
+    // - Se a última mensagem estava PENDENTE, continua PENDENTE
+    // - Se estava EM_ATENDIMENTO e o remetente anterior era Atendente, também fica PENDENTE
+    // - Caso contrário, EM_ATENDIMENTO (robô ligado)
+    let patientStatus;
+    if (lastStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente')) {
+      patientStatus = 'PENDENTE';
+    } else {
+      patientStatus = 'EM_ATENDIMENTO';
+    }
+    // Insere mensagem do paciente
     await supabase.from('messages').insert({
       instance_id: String(instanceId),
       numero_paciente: numeroPaciente,
@@ -162,25 +184,24 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
     if (respostaRobo) {
       const normalized = normaliseString(respostaRobo);
       const transferKey = 'transferir para um atendente humano';
-      // Skip robot if conversation is pending or if the last sender was a human (EM_ATENDIMENTO with remetente Atendente)
-      if (lastStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente')) {
-        // Optionally record the robot message but don't change status
-        return res.json({ received: true });
-      }
-      // Insert robot response
-      await supabase.from('messages').insert({
-        instance_id: String(instanceId),
-        numero_paciente: numeroPaciente,
-        nome_paciente: patientName,
-        mensagem_paciente: null,
-        resposta_robo: respostaRobo,
-        resposta_atendente: null,
-        remetente: 'Robô',
-        status_atendimento: 'EM_ATENDIMENTO',
-      });
-      // If transfer phrase, mark as pending
-      if (normalized.includes(transferKey)) {
-        await supabase.from('messages').update({ status_atendimento: 'PENDENTE' }).eq('numero_paciente', numeroPaciente);
+      // Define se devemos pular a resposta do robô: pendente ou conversa com atendente
+      const skipRobot = patientStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente');
+      if (!skipRobot) {
+        // Insere a resposta do robô
+        await supabase.from('messages').insert({
+          instance_id: String(instanceId),
+          numero_paciente: numeroPaciente,
+          nome_paciente: patientName,
+          mensagem_paciente: null,
+          resposta_robo: respostaRobo,
+          resposta_atendente: null,
+          remetente: 'Robô',
+          status_atendimento: 'EM_ATENDIMENTO',
+        });
+        // Se a resposta contém frase de transferência, atualiza para pendente
+        if (normalized.includes(transferKey)) {
+          await supabase.from('messages').update({ status_atendimento: 'PENDENTE' }).eq('numero_paciente', numeroPaciente);
+        }
       }
     }
     return res.json({ received: true });
@@ -190,6 +211,7 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
   }
 });
 
+// Lista de conversas agrupadas por número
 app.get('/api/conversations', async (req, res) => {
   try {
     const { data, error } = await supabase.from('messages').select('*').order('created_at', { ascending: false });
@@ -198,14 +220,16 @@ app.get('/api/conversations', async (req, res) => {
     data.forEach((msg) => {
       const key = msg.numero_paciente;
       if (!convoMap[key]) {
+        // Define status base: se explícito, usa; senão infere do remetente
         let status;
         if (msg.status_atendimento) status = msg.status_atendimento;
         else status = msg.remetente === 'Paciente' ? 'PENDENTE' : 'EM_ATENDIMENTO';
-        // Override to pending if robot says transfer
+        // Detecta frase de transferência e força pendente
         if (msg.remetente === 'Robô' && msg.resposta_robo) {
           const normalized = normaliseString(msg.resposta_robo);
           if (normalized.includes('transferir para um atendente humano')) status = 'PENDENTE';
         }
+        // Ajusta último remetente conforme status
         let lastRemetente = msg.remetente;
         if (status === 'PENDENTE') lastRemetente = 'Paciente';
         else if (status === 'FINALIZADO') lastRemetente = 'Finalizado';
@@ -227,31 +251,60 @@ app.get('/api/conversations', async (req, res) => {
   }
 });
 
+// Histórico de mensagens de um número
 app.get('/api/conversation/:numero/messages', async (req, res) => {
   const numero = req.params.numero;
-  const { data, error } = await supabase.from('messages').select('*').eq('numero_paciente', numero).order('created_at', { ascending: true });
-  if (error) return res.status(500).json({ error: 'Failed to fetch conversation' });
-  return res.json(data);
+  try {
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('numero_paciente', numero)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    return res.json(data);
+  } catch (err) {
+    console.error('Failed to fetch conversation:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch conversation' });
+  }
 });
 
+// Atualiza status de uma conversa (Finalizar ou reabrir)
 app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
   const numero = req.params.numero;
   const { statusAtendimento } = req.body;
   if (!statusAtendimento) return res.status(400).json({ error: 'statusAtendimento is required' });
-  const { error } = await supabase.from('messages').update({ status_atendimento: statusAtendimento }).eq('numero_paciente', numero);
-  if (error) return res.status(500).json({ error: 'Failed to update status' });
-  return res.json({ success: true });
+  try {
+    const { error } = await supabase
+      .from('messages')
+      .update({ status_atendimento: statusAtendimento })
+      .eq('numero_paciente', numero);
+    if (error) throw error;
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Failed to update status:', err.message);
+    return res.status(500).json({ error: 'Failed to update status' });
+  }
 });
 
+// Atualiza nome do paciente
 app.patch('/api/conversation/:numero/name', jsonParser, async (req, res) => {
   const numero = req.params.numero;
   const { nomePaciente } = req.body;
   if (!nomePaciente) return res.status(400).json({ error: 'nomePaciente is required' });
-  const { error } = await supabase.from('messages').update({ nome_paciente: nomePaciente }).eq('numero_paciente', numero);
-  if (error) return res.status(500).json({ error: 'Failed to update name' });
-  return res.json({ success: true });
+  try {
+    const { error } = await supabase
+      .from('messages')
+      .update({ nome_paciente: nomePaciente })
+      .eq('numero_paciente', numero);
+    if (error) throw error;
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Failed to update name:', err.message);
+    return res.status(500).json({ error: 'Failed to update name' });
+  }
 });
 
+// Inicia servidor
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
