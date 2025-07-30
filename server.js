@@ -77,8 +77,11 @@ app.get('/api/instances', async (req, res) => {
   const count = Number(process.env.INSTANCE_COUNT || 8);
   const list = [];
   for (let i = 0; i < count; i++) {
-    const hasToken = !!instanceTokens[i];
-    list.push({ id: String(i), hasToken: hasToken, online: hasToken });
+    // Os tokens são armazenados com chave string (por exemplo "0", "1" ...),
+    // portanto converta o índice para string antes de acessar o cache.
+    const key = String(i);
+    const hasToken = !!instanceTokens[key];
+    list.push({ id: key, hasToken: hasToken, online: hasToken });
   }
   return res.json(list);
 });
