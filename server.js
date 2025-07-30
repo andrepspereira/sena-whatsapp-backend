@@ -3,7 +3,7 @@ const bodyParser = require('body-parser');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
-// Versão 9 do servidor SENA.
+// Versão 10 do servidor SENA.
 // Nesta versão refinamos o comportamento do robô e do status para
 // alinhá‑lo ao fluxo descrito pelo usuário:
 //  - Quando um atendente humano inicia uma conversa via painel e o paciente
@@ -203,8 +203,21 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
       const transferKey = 'transferir para um atendente humano';
       // Define se devemos pular a resposta do robô: pendente ou conversa com atendente
       const skipRobot = patientStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente');
-      if (!skipRobot) {
-        // Insere a resposta do robô
+      if (skipRobot) {
+        // Mesmo que devamos pular a resposta do robô (para não reativar o robô),
+        // gravamos a mensagem no banco com status PENDENTE para que apareça no painel.
+        await supabase.from('messages').insert({
+          instance_id: String(instanceId),
+          numero_paciente: numeroPaciente,
+          nome_paciente: patientName,
+          mensagem_paciente: null,
+          resposta_robo: respostaRobo,
+          resposta_atendente: null,
+          remetente: 'Robô',
+          status_atendimento: 'PENDENTE',
+        });
+      } else {
+        // Insere a resposta do robô normalmente, com status EM_ATENDIMENTO
         await supabase.from('messages').insert({
           instance_id: String(instanceId),
           numero_paciente: numeroPaciente,
