@@ -80,8 +80,11 @@ app.get('/api/instances', async (req, res) => {
     // Os tokens são armazenados com chave string (por exemplo "0", "1" ...),
     // portanto converta o índice para string antes de acessar o cache.
     const key = String(i);
-    const hasToken = !!instanceTokens[key];
-    list.push({ id: key, hasToken: hasToken, online: hasToken });
+    const token = instanceTokens[key] || null;
+    const hasToken = !!token;
+    // Para compatibilidade com o painel, incluímos a propriedade token como
+    // booleano (true/false) ou nulo. O valor real do token não é exposto.
+    list.push({ id: key, token: hasToken, hasToken: hasToken, online: hasToken });
   }
   return res.json(list);
 });
