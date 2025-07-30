@@ -3,13 +3,13 @@ const bodyParser = require('body-parser');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
-// Versão 6 do servidor SENA.  Esta edição ajusta o fluxo de
-// pós-transferência: quando a conversa está em PENDENTE, ainda
-// permitimos gravar uma resposta do robô (por exemplo, um
-// “obrigado” ou confirmação) mas mantemos o status da conversa como
-// pendente.  Isso garante que o painel exiba todas as mensagens
-// trocadas no WhatsApp sem reativar o bot.  O restante das
-// funcionalidades permanece igual à versão 5.
+// Versão 7 do servidor SENA.  Nesta versão, o robô é desativado não
+// apenas quando uma conversa está PENDENTE, mas também quando o
+// último remetente foi um atendente humano.  Isso impede que o
+// assistente automático responda e altere o status enquanto um
+// atendente estiver conversando, mesmo que a interação tenha sido
+// iniciada pelo painel.  Outras funcionalidades das versões
+// anteriores permanecem.
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
@@ -56,6 +56,17 @@ function normaliseString(str) {
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[.!?]/g, '');
+}
+
+async function getLastMessageInfo(numeroPaciente) {
+  const { data } = await supabase
+    .from('messages')
+    .select('status_atendimento, remetente')
+    .eq('numero_paciente', numeroPaciente)
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (!data || data.length === 0) return { status_atendimento: null, remetente: null };
+  return data[0];
 }
 
 async function getCurrentStatus(numeroPaciente) {
@@ -131,9 +142,11 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
     const respostaRobo = body.respostaRobo || null;
     const patientName = body.nomePaciente || body.nome_paciente || null;
     if (!numeroPaciente || !mensagemPaciente) return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
-    // Determine the last status for this conversation
-    const lastStatus = await getCurrentStatus(numeroPaciente);
-    // Define the status for the patient message: PENDENTE if last was pending, otherwise EM_ATENDIMENTO
+    // Fetch the last message info (status and remetente)
+    const lastInfo = await getLastMessageInfo(numeroPaciente);
+    const lastStatus = lastInfo.status_atendimento;
+    const lastRemetente = lastInfo.remetente;
+    // Determine status for the patient message
     const patientStatus = lastStatus === 'PENDENTE' ? 'PENDENTE' : 'EM_ATENDIMENTO';
     // Insert the patient's message
     await supabase.from('messages').insert({
@@ -147,24 +160,14 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
       status_atendimento: patientStatus,
     });
     if (respostaRobo) {
-      // Normalise robot message for transfer detection
       const normalized = normaliseString(respostaRobo);
       const transferKey = 'transferir para um atendente humano';
-      if (lastStatus === 'PENDENTE') {
-        // Record robot reply but keep status as PENDENTE to maintain pending state
-        await supabase.from('messages').insert({
-          instance_id: String(instanceId),
-          numero_paciente: numeroPaciente,
-          nome_paciente: patientName,
-          mensagem_paciente: null,
-          resposta_robo: respostaRobo,
-          resposta_atendente: null,
-          remetente: 'Robô',
-          status_atendimento: 'PENDENTE',
-        });
+      // Skip robot if conversation is pending or if the last sender was a human (EM_ATENDIMENTO with remetente Atendente)
+      if (lastStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente')) {
+        // Optionally record the robot message but don't change status
         return res.json({ received: true });
       }
-      // Insert robot reply as EM_ATENDIMENTO
+      // Insert robot response
       await supabase.from('messages').insert({
         instance_id: String(instanceId),
         numero_paciente: numeroPaciente,
@@ -175,7 +178,7 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
         remetente: 'Robô',
         status_atendimento: 'EM_ATENDIMENTO',
       });
-      // If the robot is transferring, update to PENDENTE
+      // If transfer phrase, mark as pending
       if (normalized.includes(transferKey)) {
         await supabase.from('messages').update({ status_atendimento: 'PENDENTE' }).eq('numero_paciente', numeroPaciente);
       }
@@ -198,7 +201,7 @@ app.get('/api/conversations', async (req, res) => {
         let status;
         if (msg.status_atendimento) status = msg.status_atendimento;
         else status = msg.remetente === 'Paciente' ? 'PENDENTE' : 'EM_ATENDIMENTO';
-        // Override to PENDENTE if robot text includes transfer phrase
+        // Override to pending if robot says transfer
         if (msg.remetente === 'Robô' && msg.resposta_robo) {
           const normalized = normaliseString(msg.resposta_robo);
           if (normalized.includes('transferir para um atendente humano')) status = 'PENDENTE';
