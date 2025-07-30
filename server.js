@@ -3,7 +3,7 @@ const bodyParser = require('body-parser');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 
-// Versão 8 do servidor SENA.
+// Versão 9 do servidor SENA.
 // Nesta versão refinamos o comportamento do robô e do status para
 // alinhá‑lo ao fluxo descrito pelo usuário:
 //  - Quando um atendente humano inicia uma conversa via painel e o paciente
@@ -52,27 +52,35 @@ async function getLastMessageInfo(numeroPaciente) {
   return data[0];
 }
 
-// Rota para listar instâncias. Busca as instâncias diretamente do Supabase
-// para refletir o estado atualizado dos tokens, evitando que a "instância"
-// pareça desconectada quando o painel é recarregado.
+// In-memory cache para tokens de instância.  Carregaremos do Supabase
+// durante a inicialização e atualizaremos sempre que um token for alterado.
+const instanceTokens = {};
+
+async function preloadTokens() {
+  try {
+    const { data } = await supabase.from('instances').select('id_da_instancia, token');
+    if (data) {
+      data.forEach((row) => {
+        if (row.token) instanceTokens[row.id_da_instancia] = row.token;
+      });
+    }
+  } catch (err) {
+    console.error('Failed to preload tokens:', err.message);
+  }
+}
+
+// Carrega tokens na inicialização
+preloadTokens();
+
+// Rota para listar instâncias.  Usa o cache em memória para determinar se a instância tem token.
 app.get('/api/instances', async (req, res) => {
   const count = Number(process.env.INSTANCE_COUNT || 8);
   const list = [];
-  try {
-    const { data } = await supabase.from('instances').select('id_da_instancia, token');
-    for (let i = 0; i < count; i++) {
-      // Procura a instância no supabase; se encontrar e possuir token, está online
-      const row = data && data.find((r) => r.id_da_instancia === String(i));
-      const hasToken = row && row.token;
-      list.push({ id: String(i), hasToken: !!hasToken, online: !!hasToken });
-    }
-    return res.json(list);
-  } catch (err) {
-    console.error('Failed to fetch instances:', err.message);
-    // Em caso de erro, retorna lista vazia com offline
-    for (let i = 0; i < count; i++) list.push({ id: String(i), hasToken: false, online: false });
-    return res.json(list);
+  for (let i = 0; i < count; i++) {
+    const hasToken = !!instanceTokens[i];
+    list.push({ id: String(i), hasToken: hasToken, online: hasToken });
   }
+  return res.json(list);
 });
 
 // Rota para salvar token de instância
@@ -89,6 +97,8 @@ app.post('/api/instance/:id/token', jsonParser, async (req, res) => {
   };
   try {
     await supabase.from('instances').upsert(updates, { onConflict: 'id_da_instancia' });
+    // Atualiza cache local
+    instanceTokens[String(instanceId)] = token;
     return res.json({ success: true });
   } catch (err) {
     console.error('Failed to upsert token:', err.message);
@@ -103,13 +113,20 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
   const phone = numeroPaciente || numero_paciente;
   const patientName = nomePaciente || nome_paciente || null;
   if (!phone || !texto) return res.status(400).json({ error: 'numeroPaciente and texto are required' });
-  // Obter token atual do Supabase para garantir que a instância está online
-  let token;
-  try {
-    const { data } = await supabase.from('instances').select('token').eq('id_da_instancia', String(instanceId)).single();
-    token = data ? data.token : null;
-  } catch {
-    token = null;
+  // Obter token a partir do cache; se não existir, faz fallback ao Supabase e atualiza o cache
+  let token = instanceTokens[String(instanceId)];
+  if (!token) {
+    try {
+      const { data } = await supabase
+        .from('instances')
+        .select('token')
+        .eq('id_da_instancia', String(instanceId))
+        .single();
+      token = data ? data.token : null;
+      if (token) instanceTokens[String(instanceId)] = token;
+    } catch {
+      token = null;
+    }
   }
   if (token) {
     try {
