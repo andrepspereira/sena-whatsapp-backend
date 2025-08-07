@@ -1,4 +1,4 @@
-// server.js COMPLETO com todas as rotas e logs detalhados no webhook
+// server.js COMPLETO com simulação de insert no webhook e todas as rotas do backend SENA
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -137,6 +137,8 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
 });
 
 app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
+  console.log('📡 Requisição recebida em /api/webhook');
+
   try {
     const body = req.body || {};
     const instanceId = body.instanceId || '0';
@@ -145,7 +147,7 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
     let respostaRobo = body.respostaRobo || null;
     const patientName = body.nomePaciente || body.nome_paciente || null;
 
-    console.log('📥 DADOS RECEBIDOS NO /api/webhook');
+    console.log('📥 Dados recebidos:');
     console.log({ instanceId, numeroPaciente, patientName, mensagemPaciente, respostaRobo });
 
     if (!numeroPaciente || !mensagemPaciente) return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
@@ -166,7 +168,7 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
     const lastStatus = lastInfo.status_atendimento;
     const lastRemetente = lastInfo.remetente;
 
-    console.log('🔍 ANÁLISE DO ÚLTIMO STATUS');
+    console.log('🔍 Último status analisado:');
     console.log({ lastStatus, lastRemetente });
 
     let patientStatus;
@@ -176,7 +178,7 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
       patientStatus = 'EM_ATENDIMENTO';
     }
 
-    await supabase.from('messages').insert({
+    const insertPaciente = {
       instance_id: String(instanceId),
       numero_paciente: numeroPaciente,
       nome_paciente: patientName,
@@ -185,13 +187,17 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
       resposta_atendente: null,
       remetente: 'Paciente',
       status_atendimento: patientStatus,
-    });
+    };
+
+    console.log('📝 Simulando insert da mensagem do paciente:');
+    console.log(insertPaciente);
+    // await supabase.from('messages').insert(insertPaciente);
 
     const normalized = normaliseString(respostaRobo);
     const transferKey = 'transferir para um atendente humano';
     const skipRobot = patientStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente');
 
-    console.log('🧠 Decisão: inserir resposta da IA?');
+    console.log('🧠 Decisão de resposta IA:');
     console.log({ skipRobot, patientStatus, respostaRobo });
 
     if (respostaRobo) {
@@ -206,16 +212,19 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
         status_atendimento: skipRobot ? 'PENDENTE' : 'EM_ATENDIMENTO',
       };
 
-      await supabase.from('messages').insert(respostaData);
+      console.log('📝 Simulando insert da resposta da IA:');
+      console.log(respostaData);
+      // await supabase.from('messages').insert(respostaData);
 
       if (!skipRobot && normalized.includes(transferKey)) {
-        await supabase.from('messages').update({ status_atendimento: 'PENDENTE' }).eq('numero_paciente', numeroPaciente);
+        console.log('🔁 Simulando update de status para PENDENTE');
+        // await supabase.from('messages').update({ status_atendimento: 'PENDENTE' }).eq('numero_paciente', numeroPaciente);
       }
     }
 
     return res.json({ received: true });
   } catch (err) {
-    console.error('❌ Webhook insert failed:', err.message);
+    console.error('❌ Erro no webhook:', err.message);
     return res.status(500).json({ error: 'Webhook insert failed' });
   }
 });
