@@ -1,4 +1,4 @@
-// server.js COMPLETO com simulação de insert no webhook e todas as rotas do backend SENA
+// server.js COMPLETO com JSON.parse manual, logs e todas as rotas restauradas
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -11,7 +11,7 @@ const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 const app = express();
 
-const jsonParser = bodyParser.json({ strict: false });
+const rawBodyParser = bodyParser.text({ type: 'application/json' });
 const urlencodedParser = bodyParser.urlencoded({ extended: true });
 
 app.use((req, res, next) => {
@@ -66,9 +66,15 @@ app.get('/api/instances', async (req, res) => {
   return res.json(list);
 });
 
-app.post('/api/instance/:id/token', jsonParser, async (req, res) => {
+app.post('/api/instance/:id/token', rawBodyParser, async (req, res) => {
   const instanceId = req.params.id;
-  const { token } = req.body;
+  let body;
+  try {
+    body = JSON.parse(req.body);
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid JSON' });
+  }
+  const { token } = body;
   if (!token) return res.status(400).json({ error: 'Token is required' });
   const updates = {
     id_da_instancia: String(instanceId),
@@ -86,9 +92,15 @@ app.post('/api/instance/:id/token', jsonParser, async (req, res) => {
   }
 });
 
-app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
+app.post('/api/instance/:id/messages', rawBodyParser, async (req, res) => {
   const instanceId = req.params.id;
-  const { numeroPaciente, numero_paciente, nomePaciente, nome_paciente, texto } = req.body;
+  let body;
+  try {
+    body = JSON.parse(req.body);
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid JSON' });
+  }
+  const { numeroPaciente, numero_paciente, nomePaciente, nome_paciente, texto } = body;
   const phone = numeroPaciente || numero_paciente;
   const patientName = nomePaciente || nome_paciente || null;
   if (!phone || !texto) return res.status(400).json({ error: 'numeroPaciente and texto are required' });
@@ -136,11 +148,18 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
   }
 });
 
-app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
+app.post('/api/webhook', rawBodyParser, async (req, res) => {
   console.log('📡 Requisição recebida em /api/webhook');
 
+  let body;
   try {
-    const body = req.body || {};
+    body = JSON.parse(req.body);
+  } catch (e) {
+    console.error('❌ Falha ao fazer JSON.parse:', e.message);
+    return res.status(400).json({ error: 'JSON malformado' });
+  }
+
+  try {
     const instanceId = body.instanceId || '0';
     const numeroPaciente = body.numeroPaciente;
     const mensagemPaciente = body.mensagemPaciente;
@@ -229,6 +248,7 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
   }
 });
 
+// conversas
 app.get('/api/conversations', async (req, res) => {
   try {
     const { data, error } = await supabase.from('messages').select('*').order('created_at', { ascending: false });
@@ -279,9 +299,15 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
   }
 });
 
-app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
+app.patch('/api/conversation/:numero/status', rawBodyParser, async (req, res) => {
   const numero = req.params.numero;
-  const { statusAtendimento } = req.body;
+  let body;
+  try {
+    body = JSON.parse(req.body);
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid JSON' });
+  }
+  const { statusAtendimento } = body;
   if (!statusAtendimento) return res.status(400).json({ error: 'statusAtendimento is required' });
   try {
     const { error } = await supabase
@@ -296,9 +322,15 @@ app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
   }
 });
 
-app.patch('/api/conversation/:numero/name', jsonParser, async (req, res) => {
+app.patch('/api/conversation/:numero/name', rawBodyParser, async (req, res) => {
   const numero = req.params.numero;
-  const { nomePaciente } = req.body;
+  let body;
+  try {
+    body = JSON.parse(req.body);
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid JSON' });
+  }
+  const { nomePaciente } = body;
   if (!nomePaciente) return res.status(400).json({ error: 'nomePaciente is required' });
   try {
     const { error } = await supabase
