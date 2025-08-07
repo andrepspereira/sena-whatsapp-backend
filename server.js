@@ -222,6 +222,22 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
     return res.status(500).json({ error: 'Webhook insert failed' });
   }
 });
+// Histórico de mensagens de um número
+app.get('/api/conversation/:numero/messages', async (req, res) => {
+  const numero = req.params.numero;
+  try {
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('numero_paciente', numero)
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+    return res.json(data);
+  } catch (err) {
+    console.error('Failed to fetch conversation:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch conversation' });
+  }
+});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
