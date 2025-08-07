@@ -1,4 +1,4 @@
-// server.js COMPLETO COM LOG DE ENTRADA NA ROTA /api/webhook
+// server.js COMPLETO com todas as rotas e logs detalhados no webhook
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -145,7 +145,6 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
     let respostaRobo = body.respostaRobo || null;
     const patientName = body.nomePaciente || body.nome_paciente || null;
 
-    // LOG COMPLETO DOS DADOS RECEBIDOS
     console.log('📥 DADOS RECEBIDOS NO /api/webhook');
     console.log({ instanceId, numeroPaciente, patientName, mensagemPaciente, respostaRobo });
 
@@ -166,12 +165,17 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
     const lastInfo = await getLastMessageInfo(numeroPaciente);
     const lastStatus = lastInfo.status_atendimento;
     const lastRemetente = lastInfo.remetente;
+
+    console.log('🔍 ANÁLISE DO ÚLTIMO STATUS');
+    console.log({ lastStatus, lastRemetente });
+
     let patientStatus;
     if (lastStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente')) {
       patientStatus = 'PENDENTE';
     } else {
       patientStatus = 'EM_ATENDIMENTO';
     }
+
     await supabase.from('messages').insert({
       instance_id: String(instanceId),
       numero_paciente: numeroPaciente,
@@ -182,10 +186,15 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
       remetente: 'Paciente',
       status_atendimento: patientStatus,
     });
+
+    const normalized = normaliseString(respostaRobo);
+    const transferKey = 'transferir para um atendente humano';
+    const skipRobot = patientStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente');
+
+    console.log('🧠 Decisão: inserir resposta da IA?');
+    console.log({ skipRobot, patientStatus, respostaRobo });
+
     if (respostaRobo) {
-      const normalized = normaliseString(respostaRobo);
-      const transferKey = 'transferir para um atendente humano';
-      const skipRobot = patientStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente');
       const respostaData = {
         instance_id: String(instanceId),
         numero_paciente: numeroPaciente,
@@ -196,11 +205,14 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
         remetente: 'Robô',
         status_atendimento: skipRobot ? 'PENDENTE' : 'EM_ATENDIMENTO',
       };
+
       await supabase.from('messages').insert(respostaData);
+
       if (!skipRobot && normalized.includes(transferKey)) {
         await supabase.from('messages').update({ status_atendimento: 'PENDENTE' }).eq('numero_paciente', numeroPaciente);
       }
     }
+
     return res.json({ received: true });
   } catch (err) {
     console.error('❌ Webhook insert failed:', err.message);
