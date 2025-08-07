@@ -1,4 +1,4 @@
-// server.js COMPLETO com JSON.parse manual, logs e todas as rotas restauradas
+// server.js (versão restaurada completa com estrutura original intacta)
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -10,8 +10,7 @@ const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 const app = express();
-
-const rawBodyParser = bodyParser.text({ type: 'application/json' });
+const jsonParser = bodyParser.json();
 const urlencodedParser = bodyParser.urlencoded({ extended: true });
 
 app.use((req, res, next) => {
@@ -22,8 +21,13 @@ app.use((req, res, next) => {
   next();
 });
 
+// Helpers para normalizar e verificar a última mensagem
 function normaliseString(str) {
-  return str.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[.!?]/g, '');
+  return str
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/[.!?]/g, '');
 }
 
 async function getLastMessageInfo(numeroPaciente) {
@@ -54,6 +58,7 @@ async function preloadTokens() {
 
 preloadTokens();
 
+// Rota para listar instâncias
 app.get('/api/instances', async (req, res) => {
   const count = Number(process.env.INSTANCE_COUNT || 8);
   const list = [];
@@ -66,15 +71,10 @@ app.get('/api/instances', async (req, res) => {
   return res.json(list);
 });
 
-app.post('/api/instance/:id/token', rawBodyParser, async (req, res) => {
+// Rota para salvar token de instância
+app.post('/api/instance/:id/token', jsonParser, async (req, res) => {
   const instanceId = req.params.id;
-  let body;
-  try {
-    body = JSON.parse(req.body);
-  } catch (e) {
-    return res.status(400).json({ error: 'Invalid JSON' });
-  }
-  const { token } = body;
+  const { token } = req.body;
   if (!token) return res.status(400).json({ error: 'Token is required' });
   const updates = {
     id_da_instancia: String(instanceId),
@@ -92,18 +92,14 @@ app.post('/api/instance/:id/token', rawBodyParser, async (req, res) => {
   }
 });
 
-app.post('/api/instance/:id/messages', rawBodyParser, async (req, res) => {
+// Envio de mensagem do atendente humano
+app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
   const instanceId = req.params.id;
-  let body;
-  try {
-    body = JSON.parse(req.body);
-  } catch (e) {
-    return res.status(400).json({ error: 'Invalid JSON' });
-  }
-  const { numeroPaciente, numero_paciente, nomePaciente, nome_paciente, texto } = body;
+  const { numeroPaciente, numero_paciente, nomePaciente, nome_paciente, texto } = req.body;
   const phone = numeroPaciente || numero_paciente;
   const patientName = nomePaciente || nome_paciente || null;
   if (!phone || !texto) return res.status(400).json({ error: 'numeroPaciente and texto are required' });
+
   let token = instanceTokens[String(instanceId)];
   if (!token) {
     try {
@@ -114,6 +110,7 @@ app.post('/api/instance/:id/messages', rawBodyParser, async (req, res) => {
       token = null;
     }
   }
+
   if (token) {
     try {
       await axios.post('https://api.gupshup.io/wa/api/v1/msg', null, {
@@ -130,6 +127,7 @@ app.post('/api/instance/:id/messages', rawBodyParser, async (req, res) => {
       console.error('Failed to send message via Gupshup:', err.message);
     }
   }
+
   try {
     await supabase.from('messages').insert({
       instance_id: String(instanceId),
@@ -148,107 +146,7 @@ app.post('/api/instance/:id/messages', rawBodyParser, async (req, res) => {
   }
 });
 
-app.post('/api/webhook', rawBodyParser, async (req, res) => {
-  console.log('📡 Requisição recebida em /api/webhook');
-
-  let body;
-  try {
-    body = JSON.parse(req.body);
-  } catch (e) {
-    console.error('❌ Falha ao fazer JSON.parse:', e.message);
-    return res.status(400).json({ error: 'JSON malformado' });
-  }
-
-  try {
-    const instanceId = body.instanceId || '0';
-    const numeroPaciente = body.numeroPaciente;
-    const mensagemPaciente = body.mensagemPaciente;
-    let respostaRobo = body.respostaRobo || null;
-    const patientName = body.nomePaciente || body.nome_paciente || null;
-
-    console.log('📥 Dados recebidos:');
-    console.log({ instanceId, numeroPaciente, patientName, mensagemPaciente, respostaRobo });
-
-    if (!numeroPaciente || !mensagemPaciente) return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
-
-    if (typeof respostaRobo !== 'string') {
-      try {
-        if (typeof respostaRobo === 'object' && respostaRobo !== null) {
-          respostaRobo = respostaRobo.text || JSON.stringify(respostaRobo);
-        } else {
-          respostaRobo = String(respostaRobo);
-        }
-      } catch (e) {
-        respostaRobo = '[ERRO AO CONVERTER RESPOSTA]';
-      }
-    }
-
-    const lastInfo = await getLastMessageInfo(numeroPaciente);
-    const lastStatus = lastInfo.status_atendimento;
-    const lastRemetente = lastInfo.remetente;
-
-    console.log('🔍 Último status analisado:');
-    console.log({ lastStatus, lastRemetente });
-
-    let patientStatus;
-    if (lastStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente')) {
-      patientStatus = 'PENDENTE';
-    } else {
-      patientStatus = 'EM_ATENDIMENTO';
-    }
-
-    const insertPaciente = {
-      instance_id: String(instanceId),
-      numero_paciente: numeroPaciente,
-      nome_paciente: patientName,
-      mensagem_paciente: mensagemPaciente,
-      resposta_robo: null,
-      resposta_atendente: null,
-      remetente: 'Paciente',
-      status_atendimento: patientStatus,
-    };
-
-    console.log('📝 Simulando insert da mensagem do paciente:');
-    console.log(insertPaciente);
-    // await supabase.from('messages').insert(insertPaciente);
-
-    const normalized = normaliseString(respostaRobo);
-    const transferKey = 'transferir para um atendente humano';
-    const skipRobot = patientStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente');
-
-    console.log('🧠 Decisão de resposta IA:');
-    console.log({ skipRobot, patientStatus, respostaRobo });
-
-    if (respostaRobo) {
-      const respostaData = {
-        instance_id: String(instanceId),
-        numero_paciente: numeroPaciente,
-        nome_paciente: patientName,
-        mensagem_paciente: null,
-        resposta_robo: respostaRobo,
-        resposta_atendente: null,
-        remetente: 'Robô',
-        status_atendimento: skipRobot ? 'PENDENTE' : 'EM_ATENDIMENTO',
-      };
-
-      console.log('📝 Simulando insert da resposta da IA:');
-      console.log(respostaData);
-      // await supabase.from('messages').insert(respostaData);
-
-      if (!skipRobot && normalized.includes(transferKey)) {
-        console.log('🔁 Simulando update de status para PENDENTE');
-        // await supabase.from('messages').update({ status_atendimento: 'PENDENTE' }).eq('numero_paciente', numeroPaciente);
-      }
-    }
-
-    return res.json({ received: true });
-  } catch (err) {
-    console.error('❌ Erro no webhook:', err.message);
-    return res.status(500).json({ error: 'Webhook insert failed' });
-  }
-});
-
-// conversas
+// Rota para listar conversas agrupadas por paciente
 app.get('/api/conversations', async (req, res) => {
   try {
     const { data, error } = await supabase.from('messages').select('*').order('created_at', { ascending: false });
@@ -283,6 +181,7 @@ app.get('/api/conversations', async (req, res) => {
   }
 });
 
+// Histórico de mensagens de um número
 app.get('/api/conversation/:numero/messages', async (req, res) => {
   const numero = req.params.numero;
   try {
@@ -299,15 +198,10 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
   }
 });
 
-app.patch('/api/conversation/:numero/status', rawBodyParser, async (req, res) => {
+// Atualiza status de uma conversa
+app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
   const numero = req.params.numero;
-  let body;
-  try {
-    body = JSON.parse(req.body);
-  } catch (e) {
-    return res.status(400).json({ error: 'Invalid JSON' });
-  }
-  const { statusAtendimento } = body;
+  const { statusAtendimento } = req.body;
   if (!statusAtendimento) return res.status(400).json({ error: 'statusAtendimento is required' });
   try {
     const { error } = await supabase
@@ -322,15 +216,10 @@ app.patch('/api/conversation/:numero/status', rawBodyParser, async (req, res) =>
   }
 });
 
-app.patch('/api/conversation/:numero/name', rawBodyParser, async (req, res) => {
+// Atualiza nome do paciente
+app.patch('/api/conversation/:numero/name', jsonParser, async (req, res) => {
   const numero = req.params.numero;
-  let body;
-  try {
-    body = JSON.parse(req.body);
-  } catch (e) {
-    return res.status(400).json({ error: 'Invalid JSON' });
-  }
-  const { nomePaciente } = body;
+  const { nomePaciente } = req.body;
   if (!nomePaciente) return res.status(400).json({ error: 'nomePaciente is required' });
   try {
     const { error } = await supabase
@@ -345,6 +234,85 @@ app.patch('/api/conversation/:numero/name', rawBodyParser, async (req, res) => {
   }
 });
 
+// Webhook para mensagens de pacientes e respostas do robô
+app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const instanceId = body.instanceId || '0';
+    const numeroPaciente = body.numeroPaciente;
+    const mensagemPaciente = body.mensagemPaciente;
+    const respostaRobo = body.respostaRobo || null;
+    const patientName = body.nomePaciente || body.nome_paciente || null;
+    if (!numeroPaciente || !mensagemPaciente) return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
+    // Pega última informação (status e remetente)
+    const lastInfo = await getLastMessageInfo(numeroPaciente);
+    const lastStatus = lastInfo.status_atendimento;
+    const lastRemetente = lastInfo.remetente;
+    // Determina status da mensagem do paciente:
+    // - Se a última mensagem estava PENDENTE, continua PENDENTE
+    // - Se estava EM_ATENDIMENTO e o remetente anterior era Atendente, também fica PENDENTE
+    // - Caso contrário, EM_ATENDIMENTO (robô ligado)
+    let patientStatus;
+    if (lastStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente')) {
+      patientStatus = 'PENDENTE';
+    } else {
+      patientStatus = 'EM_ATENDIMENTO';
+    }
+    // Insere mensagem do paciente
+    await supabase.from('messages').insert({
+      instance_id: String(instanceId),
+      numero_paciente: numeroPaciente,
+      nome_paciente: patientName,
+      mensagem_paciente: mensagemPaciente,
+      resposta_robo: null,
+      resposta_atendente: null,
+      remetente: 'Paciente',
+      status_atendimento: patientStatus,
+    });
+    if (respostaRobo) {
+      const normalized = normaliseString(respostaRobo);
+      const transferKey = 'transferir para um atendente humano';
+      // Define se devemos pular a resposta do robô: pendente ou conversa com atendente
+      const skipRobot = patientStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente');
+      if (skipRobot) {
+        // Mesmo que devamos pular a resposta do robô (para não reativar o robô),
+        // gravamos a mensagem no banco com status PENDENTE para que apareça no painel.
+        await supabase.from('messages').insert({
+          instance_id: String(instanceId),
+          numero_paciente: numeroPaciente,
+          nome_paciente: patientName,
+          mensagem_paciente: null,
+          resposta_robo: respostaRobo,
+          resposta_atendente: null,
+          remetente: 'Robô',
+          status_atendimento: 'PENDENTE',
+        });
+      } else {
+        // Insere a resposta do robô normalmente, com status EM_ATENDIMENTO
+        await supabase.from('messages').insert({
+          instance_id: String(instanceId),
+          numero_paciente: numeroPaciente,
+          nome_paciente: patientName,
+          mensagem_paciente: null,
+          resposta_robo: respostaRobo,
+          resposta_atendente: null,
+          remetente: 'Robô',
+          status_atendimento: 'EM_ATENDIMENTO',
+        });
+        // Se a resposta contém frase de transferência, atualiza para pendente
+        if (normalized.includes(transferKey)) {
+          await supabase.from('messages').update({ status_atendimento: 'PENDENTE' }).eq('numero_paciente', numeroPaciente);
+        }
+      }
+    }
+    return res.json({ received: true });
+  } catch (err) {
+    console.error('Webhook insert failed:', err.message);
+    return res.status(500).json({ error: 'Webhook insert failed' });
+  }
+});
+
+// Inicia servidor
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
