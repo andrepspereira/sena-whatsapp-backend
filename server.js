@@ -1,4 +1,4 @@
-// server.js (completo, com log do corpo cru + bodyParser flexível + rotas e tratamento respostaRobo)
+// server.js COMPLETO com webhook ajustado + tratamento respostaRobo + rotas originais restauradas
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -144,18 +144,19 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
     const mensagemPaciente = body.mensagemPaciente;
     let respostaRobo = body.respostaRobo || null;
     const patientName = body.nomePaciente || body.nome_paciente || null;
+
     if (!numeroPaciente || !mensagemPaciente) return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
 
-    try {
-      if (typeof respostaRobo !== 'string') {
+    if (typeof respostaRobo !== 'string') {
+      try {
         if (typeof respostaRobo === 'object' && respostaRobo !== null) {
           respostaRobo = respostaRobo.text || JSON.stringify(respostaRobo);
         } else {
           respostaRobo = String(respostaRobo);
         }
+      } catch (e) {
+        respostaRobo = '[ERRO AO CONVERTER RESPOSTA]';
       }
-    } catch (e) {
-      respostaRobo = '[ERRO AO CONVERTER RESPOSTA]';
     }
 
     const lastInfo = await getLastMessageInfo(numeroPaciente);
@@ -181,31 +182,19 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
       const normalized = normaliseString(respostaRobo);
       const transferKey = 'transferir para um atendente humano';
       const skipRobot = patientStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente');
-      if (skipRobot) {
-        await supabase.from('messages').insert({
-          instance_id: String(instanceId),
-          numero_paciente: numeroPaciente,
-          nome_paciente: patientName,
-          mensagem_paciente: null,
-          resposta_robo: respostaRobo,
-          resposta_atendente: null,
-          remetente: 'Robô',
-          status_atendimento: 'PENDENTE',
-        });
-      } else {
-        await supabase.from('messages').insert({
-          instance_id: String(instanceId),
-          numero_paciente: numeroPaciente,
-          nome_paciente: patientName,
-          mensagem_paciente: null,
-          resposta_robo: respostaRobo,
-          resposta_atendente: null,
-          remetente: 'Robô',
-          status_atendimento: 'EM_ATENDIMENTO',
-        });
-        if (normalized.includes(transferKey)) {
-          await supabase.from('messages').update({ status_atendimento: 'PENDENTE' }).eq('numero_paciente', numeroPaciente);
-        }
+      const respostaData = {
+        instance_id: String(instanceId),
+        numero_paciente: numeroPaciente,
+        nome_paciente: patientName,
+        mensagem_paciente: null,
+        resposta_robo: respostaRobo,
+        resposta_atendente: null,
+        remetente: 'Robô',
+        status_atendimento: skipRobot ? 'PENDENTE' : 'EM_ATENDIMENTO',
+      };
+      await supabase.from('messages').insert(respostaData);
+      if (!skipRobot && normalized.includes(transferKey)) {
+        await supabase.from('messages').update({ status_atendimento: 'PENDENTE' }).eq('numero_paciente', numeroPaciente);
       }
     }
     return res.json({ received: true });
