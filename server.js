@@ -10,7 +10,7 @@ const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 const app = express();
-const jsonParser = bodyParser.json();
+const rawBodyParser = bodyParser.text({ type: 'application/json' });
 const urlencodedParser = bodyParser.urlencoded({ extended: true });
 
 app.use((req, res, next) => {
@@ -235,9 +235,15 @@ app.patch('/api/conversation/:numero/name', jsonParser, async (req, res) => {
 });
 
 // Webhook para mensagens de pacientes e respostas do robô
-app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
+app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
   try {
-    const body = req.body || {};
+    let body;
+try {
+  body = JSON.parse(req.body);
+} catch (e) {
+  console.error('❌ JSON malformado:', e.message);
+  return res.status(400).json({ error: 'JSON malformado' });
+}
     const instanceId = body.instanceId || '0';
     const numeroPaciente = body.numeroPaciente;
     const mensagemPaciente = body.mensagemPaciente;
