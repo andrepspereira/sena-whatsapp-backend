@@ -147,12 +147,14 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
 // Webhook com JSON.parse manual (evita erro na 2ª ou 3ª mensagem)
 app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
   let body;
-  try {
-    body = JSON.parse(req.body);
-  } catch (e) {
-    console.error('❌ JSON malformado:', e.message);
-    return res.status(400).json({ error: 'JSON malformado' });
-  }
+try {
+  // Limpa caracteres de controle antes do parse
+  const cleaned = req.body.replace(/[\u0000-\u001F\u007F]/g, '');
+  body = JSON.parse(cleaned);
+} catch (e) {
+  console.error('❌ JSON malformado:', e.message);
+  return res.status(400).json({ error: 'JSON malformado' });
+}
 
   try {
     const instanceId = body.instanceId || '0';
