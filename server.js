@@ -1,4 +1,4 @@
-// server.js (versão completa com tratamento seguro de respostaRobo)
+// server.js (completo, com log do corpo cru + bodyParser flexível + rotas e tratamento respostaRobo)
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -10,7 +10,20 @@ const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 const app = express();
-const jsonParser = bodyParser.json();
+
+app.use((req, res, next) => {
+  let raw = '';
+  req.on('data', chunk => {
+    raw += chunk;
+  });
+  req.on('end', () => {
+    console.log('RAW BODY RECEIVED:');
+    console.log(raw);
+    next();
+  });
+});
+
+const jsonParser = bodyParser.json({ strict: false });
 const urlencodedParser = bodyParser.urlencoded({ extended: true });
 
 app.use((req, res, next) => {
@@ -22,7 +35,7 @@ app.use((req, res, next) => {
 });
 
 function normaliseString(str) {
-  return str.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[.!?]/g, '');
+  return str.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[.!?]/g, '');
 }
 
 async function getLastMessageInfo(numeroPaciente) {
@@ -145,7 +158,6 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
     const patientName = body.nomePaciente || body.nome_paciente || null;
     if (!numeroPaciente || !mensagemPaciente) return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
 
-    // Tratamento seguro para respostaRobo
     try {
       if (typeof respostaRobo !== 'string') {
         if (typeof respostaRobo === 'object' && respostaRobo !== null) {
