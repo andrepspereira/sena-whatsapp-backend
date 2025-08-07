@@ -1,3 +1,5 @@
+// server.js (versão completa com tratamento seguro de respostaRobo)
+
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
@@ -20,11 +22,7 @@ app.use((req, res, next) => {
 });
 
 function normaliseString(str) {
-  return str
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[.!?]/g, '');
+  return str.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[.!?]/g, '');
 }
 
 async function getLastMessageInfo(numeroPaciente) {
@@ -71,7 +69,6 @@ app.post('/api/instance/:id/token', jsonParser, async (req, res) => {
   const instanceId = req.params.id;
   const { token } = req.body;
   if (!token) return res.status(400).json({ error: 'Token is required' });
-
   const updates = {
     id_da_instancia: String(instanceId),
     token: token,
@@ -94,22 +91,16 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
   const phone = numeroPaciente || numero_paciente;
   const patientName = nomePaciente || nome_paciente || null;
   if (!phone || !texto) return res.status(400).json({ error: 'numeroPaciente and texto are required' });
-
   let token = instanceTokens[String(instanceId)];
   if (!token) {
     try {
-      const { data } = await supabase
-        .from('instances')
-        .select('token')
-        .eq('id_da_instancia', String(instanceId))
-        .single();
+      const { data } = await supabase.from('instances').select('token').eq('id_da_instancia', String(instanceId)).single();
       token = data ? data.token : null;
       if (token) instanceTokens[String(instanceId)] = token;
     } catch {
       token = null;
     }
   }
-
   if (token) {
     try {
       await axios.post('https://api.gupshup.io/wa/api/v1/msg', null, {
@@ -126,7 +117,6 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
       console.error('Failed to send message via Gupshup:', err.message);
     }
   }
-
   try {
     await supabase.from('messages').insert({
       instance_id: String(instanceId),
@@ -153,32 +143,30 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
     const mensagemPaciente = body.mensagemPaciente;
     let respostaRobo = body.respostaRobo || null;
     const patientName = body.nomePaciente || body.nome_paciente || null;
+    if (!numeroPaciente || !mensagemPaciente) return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
 
-    if (!numeroPaciente || !mensagemPaciente) {
-      return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
-    }
-
-    if (typeof respostaRobo === 'object' && respostaRobo !== null) {
-      respostaRobo = respostaRobo.text || JSON.stringify(respostaRobo);
-    }
-    if (typeof respostaRobo === 'number') {
-      respostaRobo = respostaRobo.toString();
-    }
-    if (!respostaRobo) {
-      respostaRobo = '';
+    // Tratamento seguro para respostaRobo
+    try {
+      if (typeof respostaRobo !== 'string') {
+        if (typeof respostaRobo === 'object' && respostaRobo !== null) {
+          respostaRobo = respostaRobo.text || JSON.stringify(respostaRobo);
+        } else {
+          respostaRobo = String(respostaRobo);
+        }
+      }
+    } catch (e) {
+      respostaRobo = '[ERRO AO CONVERTER RESPOSTA]';
     }
 
     const lastInfo = await getLastMessageInfo(numeroPaciente);
     const lastStatus = lastInfo.status_atendimento;
     const lastRemetente = lastInfo.remetente;
-
     let patientStatus;
     if (lastStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente')) {
       patientStatus = 'PENDENTE';
     } else {
       patientStatus = 'EM_ATENDIMENTO';
     }
-
     await supabase.from('messages').insert({
       instance_id: String(instanceId),
       numero_paciente: numeroPaciente,
@@ -189,7 +177,6 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
       remetente: 'Paciente',
       status_atendimento: patientStatus,
     });
-
     if (respostaRobo) {
       const normalized = normaliseString(respostaRobo);
       const transferKey = 'transferir para um atendente humano';
@@ -217,13 +204,10 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
           status_atendimento: 'EM_ATENDIMENTO',
         });
         if (normalized.includes(transferKey)) {
-          await supabase.from('messages')
-            .update({ status_atendimento: 'PENDENTE' })
-            .eq('numero_paciente', numeroPaciente);
+          await supabase.from('messages').update({ status_atendimento: 'PENDENTE' }).eq('numero_paciente', numeroPaciente);
         }
       }
     }
-
     return res.json({ received: true });
   } catch (err) {
     console.error('Webhook insert failed:', err.message);
@@ -239,19 +223,14 @@ app.get('/api/conversations', async (req, res) => {
     data.forEach((msg) => {
       const key = msg.numero_paciente;
       if (!convoMap[key]) {
-        let status;
-        if (msg.status_atendimento) status = msg.status_atendimento;
-        else status = msg.remetente === 'Paciente' ? 'PENDENTE' : 'EM_ATENDIMENTO';
-
+        let status = msg.status_atendimento || (msg.remetente === 'Paciente' ? 'PENDENTE' : 'EM_ATENDIMENTO');
         if (msg.remetente === 'Robô' && msg.resposta_robo) {
           const normalized = normaliseString(msg.resposta_robo);
           if (normalized.includes('transferir para um atendente humano')) status = 'PENDENTE';
         }
-
         let lastRemetente = msg.remetente;
         if (status === 'PENDENTE') lastRemetente = 'Paciente';
         else if (status === 'FINALIZADO') lastRemetente = 'Finalizado';
-
         convoMap[key] = {
           numeroPaciente: msg.numero_paciente,
           nomePaciente: msg.nome_paciente || null,
