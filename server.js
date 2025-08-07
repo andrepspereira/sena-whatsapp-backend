@@ -1,4 +1,4 @@
-// server.js COMPLETO com webhook ajustado + tratamento respostaRobo + rotas originais restauradas
+// server.js COMPLETO COM LOG DE ENTRADA NA ROTA /api/webhook
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -145,6 +145,10 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
     let respostaRobo = body.respostaRobo || null;
     const patientName = body.nomePaciente || body.nome_paciente || null;
 
+    // LOG COMPLETO DOS DADOS RECEBIDOS
+    console.log('📥 DADOS RECEBIDOS NO /api/webhook');
+    console.log({ instanceId, numeroPaciente, patientName, mensagemPaciente, respostaRobo });
+
     if (!numeroPaciente || !mensagemPaciente) return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
 
     if (typeof respostaRobo !== 'string') {
@@ -199,7 +203,7 @@ app.post('/api/webhook', jsonParser, urlencodedParser, async (req, res) => {
     }
     return res.json({ received: true });
   } catch (err) {
-    console.error('Webhook insert failed:', err.message);
+    console.error('❌ Webhook insert failed:', err.message);
     return res.status(500).json({ error: 'Webhook insert failed' });
   }
 });
