@@ -11,18 +11,6 @@ const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
 const app = express();
 
-app.use((req, res, next) => {
-  let raw = '';
-  req.on('data', chunk => {
-    raw += chunk;
-  });
-  req.on('end', () => {
-    console.log('RAW BODY RECEIVED:');
-    console.log(raw);
-    next();
-  });
-});
-
 const jsonParser = bodyParser.json({ strict: false });
 const urlencodedParser = bodyParser.urlencoded({ extended: true });
 
