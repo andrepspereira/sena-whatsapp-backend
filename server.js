@@ -20,7 +20,7 @@ app.use((req, res, next) => {
   next();
 });
 
-/* ---------------------------------- utils --------------------------------- */
+/* ============================== Utils ============================== */
 function normaliseString(str = '') {
   return String(str)
     .toLowerCase()
@@ -35,6 +35,8 @@ function envSourceForInstance(id) {
   const k = `GSWHATSAPP_NUMBER_${String(id)}`;
   return process.env[k] || process.env.GSWHATSAPP_NUMBER || '';
 }
+
+// Gupshup: mensagem de sessão (texto) — form-urlencoded + message em JSON
 async function sendWhatsAppSessionMessage({ token, source, destination, text }) {
   const body = new URLSearchParams();
   body.append('channel', 'whatsapp');
@@ -44,7 +46,11 @@ async function sendWhatsAppSessionMessage({ token, source, destination, text }) 
   body.append('src.name', process.env.GSAPP_NAME || 'SENA');
 
   const res = await axios.post('https://api.gupshup.io/wa/api/v1/msg', body, {
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded', apikey: token, 'cache-control': 'no-cache' },
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      apikey: token,
+      'cache-control': 'no-cache',
+    },
     timeout: 15000,
     validateStatus: () => true,
   });
@@ -53,13 +59,10 @@ async function sendWhatsAppSessionMessage({ token, source, destination, text }) 
   if (res.status >= 400) console.error('Gupshup ERROR', res.status, bodyStr);
   else console.log('Gupshup OK', res.status, bodyStr.slice(0, 200));
 
-  if (res.status === 400 && /24h|24 h|24 hours|session/i.test(bodyStr)) {
-    throw new Error('Fora da janela de 24h: use template.');
-  }
   return res;
 }
 
-/* ------------------------- supabase helpers & cache ------------------------ */
+/* ==================== Supabase helpers & cache ===================== */
 async function getLastMessageInfo(numeroPaciente) {
   const { data } = await supabase
     .from('messages')
@@ -71,12 +74,12 @@ async function getLastMessageInfo(numeroPaciente) {
   return data[0];
 }
 
-// guarda token + source_number por instância
+// cache por instância: token + source_number
 const instanceMeta = {}; // { [id]: { token, source_number } }
 
 async function preloadInstances() {
   try {
-    // se sua tabela tiver 'source_number', ótimo; se não, fica undefined
+    // se não tiver source_number na tabela, tudo bem; cairemos nas ENVs
     const { data } = await supabase.from('instances').select('id_da_instancia, token, source_number');
     if (data) {
       data.forEach((row) => {
@@ -93,7 +96,8 @@ async function preloadInstances() {
 }
 preloadInstances();
 
-/* ----------------------------------- API ---------------------------------- */
+/* ============================== API =============================== */
+// Ver instâncias/tokens/sources
 app.get('/api/instances', async (req, res) => {
   const count = Number(process.env.INSTANCE_COUNT || 8);
   const list = [];
@@ -101,11 +105,18 @@ app.get('/api/instances', async (req, res) => {
     const key = String(i);
     const meta = instanceMeta[key] || {};
     const hasToken = !!meta.token;
-    list.push({ id: key, token: hasToken, hasToken, online: hasToken, source: meta.source_number || null });
+    list.push({
+      id: key,
+      token: hasToken,
+      hasToken,
+      online: hasToken,
+      source: meta.source_number || envSourceForInstance(key) || null,
+    });
   }
   return res.json(list);
 });
 
+// Salvar token (e opcionalmente source_number) da instância
 app.post('/api/instance/:id/token', jsonParser, async (req, res) => {
   const instanceId = String(req.params.id);
   const { token, source_number } = req.body;
@@ -131,7 +142,7 @@ app.post('/api/instance/:id/token', jsonParser, async (req, res) => {
   }
 });
 
-/* --------------------------- HUMANO → WHATSAPP ---------------------------- */
+/* ======================= HUMANO → WHATSAPP ======================== */
 app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
   const instanceId = String(req.params.id);
   const { numeroPaciente, numero_paciente, nomePaciente, nome_paciente, texto } = req.body;
@@ -153,8 +164,8 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
     };
   }
 
-  // tenta enviar
-  if (meta.token && (meta.source_number || process.env.GSWHATSAPP_NUMBER)) {
+  // Envia mensagem do humano
+  if (meta.token && (meta.source_number || envSourceForInstance(instanceId))) {
     try {
       await sendWhatsAppSessionMessage({
         token: meta.token,
@@ -164,13 +175,13 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
       });
     } catch (err) {
       console.error('Failed to send message via Gupshup:', err.message);
-      // return res.status(409).json({ error: 'window_24h', detail: err.message });
+      // se precisar sinalizar para a UI: return res.status(502).json({ error: 'gupshup_fail', detail: err.message });
     }
   } else {
     console.error('Missing token/source for instance', instanceId, meta);
   }
 
-  // loga no banco
+  // Loga no banco — status padronizado
   try {
     await supabase.from('messages').insert({
       instance_id: instanceId,
@@ -180,7 +191,7 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
       resposta_robo: null,
       resposta_atendente: texto,
       remetente: 'Atendente',
-      status_atendimento: 'EM_ATENDIMENTO (HUMANO)',
+      status_atendimento: 'EM_ATENDIMENTO',
     });
     return res.json({ success: true });
   } catch (err) {
@@ -189,7 +200,7 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
   }
 });
 
-// opcional: envio direto sem amarrar à rota da instância
+// (Opcional) endpoint direto pro painel
 app.post('/api/agent/reply', jsonParser, async (req, res) => {
   const { chatId, text, instanceId, nomePaciente } = req.body;
   const phone = normalizePhone(chatId);
@@ -227,7 +238,7 @@ app.post('/api/agent/reply', jsonParser, async (req, res) => {
       resposta_robo: null,
       resposta_atendente: text,
       remetente: 'Atendente',
-      status_atendimento: 'EM_ATENDIMENTO (HUMANO)',
+      status_atendimento: 'EM_ATENDIMENTO',
     });
     return res.json({ ok: true });
   } catch (err) {
@@ -236,8 +247,8 @@ app.post('/api/agent/reply', jsonParser, async (req, res) => {
   }
 });
 
-/* ------------------------------- WEBHOOK ---------------------------------- */
-// recebe payload do Make/Gupshup
+/* ============================ WEBHOOK ============================== */
+// Recebe do Make/Gupshup
 app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
   let body;
   try {
@@ -259,14 +270,14 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
       return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
     }
 
-    // status anterior
+    // Último status
     const lastInfo = await getLastMessageInfo(numeroPaciente);
     const lastStatus = lastInfo.status_atendimento;
     const lastRemetente = lastInfo.remetente;
 
-    // calcula status do registro da msg do paciente
+    // Define status desta mensagem do paciente
     let patientStatus;
-    if (lastStatus === 'PENDENTE' || lastStatus === 'EM_ATENDIMENTO (HUMANO)' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente')) {
+    if (lastStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente')) {
       patientStatus = 'PENDENTE';
     } else if (lastStatus === 'FINALIZADO') {
       patientStatus = 'FINALIZADO';
@@ -274,7 +285,7 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
       patientStatus = 'EM_ATENDIMENTO';
     }
 
-    // grava mensagem do paciente
+    // 1) Grava mensagem do paciente
     await supabase.from('messages').insert({
       instance_id: instanceId,
       numero_paciente: numeroPaciente,
@@ -286,14 +297,14 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
       status_atendimento: patientStatus,
     });
 
-    // resposta do robô (se houver)
+    // 2) Grava resposta do robô (se houver) — respeitando status
     if (respostaRobo) {
       const normalized = normaliseString(respostaRobo);
       const transferKey = 'transferir para um atendente humano';
 
-      // se já está pendente/finalizado → não grava resposta do robô (desliga)
+      // Se já está PENDENTE/FINALIZADO → não grava resposta do robô
       if (patientStatus === 'PENDENTE' || patientStatus === 'FINALIZADO') {
-        console.log('Robô suprimido (status atual impede resposta).');
+        console.log('Robô suprimido (status impede resposta).');
         return res.json({ received: true, suppressed: true });
       }
 
@@ -308,8 +319,12 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
         status_atendimento: 'EM_ATENDIMENTO',
       });
 
+      // Detecta transferência pela frase e marca PENDENTE
       if (normalized.includes(transferKey)) {
-        await supabase.from('messages').update({ status_atendimento: 'PENDENTE' }).eq('numero_paciente', numeroPaciente);
+        await supabase
+          .from('messages')
+          .update({ status_atendimento: 'PENDENTE' })
+          .eq('numero_paciente', numeroPaciente);
       }
     }
 
@@ -320,14 +335,14 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
   }
 });
 
-/* ----------------------- consultas e operações de UI ---------------------- */
-// lista de conversas (uma por número), status pela ÚLTIMA mensagem real
+/* =================== Consultas para o painel/UI =================== */
+// Lista de conversas (uma por número) — com base NA ÚLTIMA mensagem real
 app.get('/api/conversations', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('messages')
       .select('*')
-      .order('created_at', { ascending: true }); // vamos reduzir no código
+      .order('created_at', { ascending: true });
     if (error) throw error;
 
     const byNumero = new Map();
@@ -342,7 +357,7 @@ app.get('/api/conversations', async (req, res) => {
     const list = [];
     for (const [numero, msg] of byNumero.entries()) {
       let status = msg.status_atendimento || 'EM_ATENDIMENTO';
-      // se a última foi do robô e contém frase de transferência → pendente
+      // se a última foi do robô e contém frase de transferência → PENDENTE
       if (msg.remetente === 'Robô' && msg.resposta_robo) {
         const normalized = normaliseString(msg.resposta_robo);
         if (normalized.includes('transferir para um atendente humano')) status = 'PENDENTE';
@@ -352,13 +367,13 @@ app.get('/api/conversations', async (req, res) => {
         nomePaciente: msg.nome_paciente || null,
         lastMessage: msg.mensagem_paciente || msg.resposta_robo || msg.resposta_atendente,
         statusAtendimento: status,
-        lastRemetente: msg.remetente, // sem override artificial
+        lastRemetente: msg.remetente, // quem realmente enviou por último
         updatedAt: msg.updated_at,
         instanceId: msg.instance_id,
       });
     }
 
-    // ordena desc por updatedAt pra UI ficar suave
+    // ordena desc por updatedAt
     list.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
     return res.json(list);
   } catch (err) {
@@ -367,7 +382,7 @@ app.get('/api/conversations', async (req, res) => {
   }
 });
 
-// histórico de um número
+// Histórico completo de um número
 app.get('/api/conversation/:numero/messages', async (req, res) => {
   const numero = normalizePhone(req.params.numero);
   try {
@@ -384,11 +399,12 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
   }
 });
 
-// atualiza status (finalizar/reabrir)
+// Atualiza status (Finalizar/Reabrir)
 app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
   const numero = normalizePhone(req.params.numero);
   const { statusAtendimento } = req.body;
-  if (!statusAtendimento) return res.status(400).json({ error: 'statusAtendimento is required' });
+  if (!statusAtendimento)
+    return res.status(400).json({ error: 'statusAtendimento is required' });
 
   try {
     const { error } = await supabase
@@ -403,11 +419,12 @@ app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
   }
 });
 
-// atualiza nome
+// Atualiza nome do paciente
 app.patch('/api/conversation/:numero/name', jsonParser, async (req, res) => {
   const numero = normalizePhone(req.params.numero);
   const { nomePaciente } = req.body;
-  if (!nomePaciente) return res.status(400).json({ error: 'nomePaciente is required' });
+  if (!nomePaciente)
+    return res.status(400).json({ error: 'nomePaciente is required' });
 
   try {
     const { error } = await supabase
@@ -422,7 +439,7 @@ app.patch('/api/conversation/:numero/name', jsonParser, async (req, res) => {
   }
 });
 
-/* --------------------------------- start ---------------------------------- */
+/* ============================== Start ============================== */
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
