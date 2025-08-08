@@ -20,14 +20,55 @@ app.use((req, res, next) => {
   next();
 });
 
-function normaliseString(str) {
-  return str
+// ---------- Utils ----------
+function normaliseString(str = '') {
+  return String(str)
     .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[.!?]/g, '');
 }
 
+// Garante número só com dígitos (ex.: 55DDDNUMERO)
+function normalizePhone(p) {
+  return String(p || '').replace(/[^\d]/g, '');
+}
+
+// Envia MENSAGEM DE SESSÃO (texto) via Gupshup (form-urlencoded + message em JSON)
+async function sendWhatsAppSessionMessage({ token, source, destination, text }) {
+  const body = new URLSearchParams();
+  body.append('channel', 'whatsapp');
+  body.append('source', normalizePhone(source));
+  body.append('destination', normalizePhone(destination));
+  body.append('message', JSON.stringify({ type: 'text', text }));
+  body.append('src.name', process.env.GSAPP_NAME || 'SENA');
+
+  const res = await axios.post('https://api.gupshup.io/wa/api/v1/msg', body, {
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      apikey: token,
+      'cache-control': 'no-cache',
+    },
+    timeout: 15000,
+    validateStatus: () => true,
+  });
+
+  if (res.status >= 400) {
+    console.error('Gupshup ERROR', res.status, res.data);
+  } else {
+    console.log('Gupshup OK', res.status, typeof res.data === 'string' ? res.data.slice(0, 200) : res.data);
+  }
+
+  // Sinaliza janela de 24h estourada (mensagem típica da API)
+  const bodyStr = typeof res.data === 'string' ? res.data : JSON.stringify(res.data || {});
+  if (res.status === 400 && /24h|24 h|24 hours|session/i.test(bodyStr)) {
+    throw new Error('Fora da janela de 24h: use template.');
+  }
+
+  return res;
+}
+
+// ---------- Supabase helpers ----------
 async function getLastMessageInfo(numeroPaciente) {
   const { data } = await supabase
     .from('messages')
@@ -43,6 +84,7 @@ const instanceTokens = {};
 
 async function preloadTokens() {
   try {
+    // Mantém compatível com seu schema atual (id_da_instancia)
     const { data } = await supabase.from('instances').select('id_da_instancia, token');
     if (data) {
       data.forEach((row) => {
@@ -56,6 +98,7 @@ async function preloadTokens() {
 
 preloadTokens();
 
+// ---------- API ----------
 app.get('/api/instances', async (req, res) => {
   const count = Number(process.env.INSTANCE_COUNT || 8);
   const list = [];
@@ -83,15 +126,16 @@ app.post('/api/instance/:id/token', jsonParser, async (req, res) => {
     instanceTokens[String(instanceId)] = token;
     return res.json({ success: true });
   } catch (err) {
-    console.error('Failed to upsert token:', err.message);
+    console.error('Failed to save token:', err.message);
     return res.status(500).json({ error: 'Failed to save token' });
   }
 });
 
+// ---------------- HUMANO → WHATSAPP ----------------
 app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
   const instanceId = req.params.id;
   const { numeroPaciente, numero_paciente, nomePaciente, nome_paciente, texto } = req.body;
-  const phone = numeroPaciente || numero_paciente;
+  const phone = normalizePhone(numeroPaciente || numero_paciente);
   const patientName = nomePaciente || nome_paciente || null;
   if (!phone || !texto) return res.status(400).json({ error: 'numeroPaciente and texto are required' });
 
@@ -112,19 +156,19 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
 
   if (token) {
     try {
-      await axios.post('https://api.gupshup.io/wa/api/v1/msg', null, {
-        params: {
-          channel: 'whatsapp',
-          source: process.env.GSWHATSAPP_NUMBER,
-          destination: phone,
-          message: texto,
-          'src.name': process.env.GSAPP_NAME,
-        },
-        headers: { apikey: token },
+      await sendWhatsAppSessionMessage({
+        token,
+        source: process.env.GSWHATSAPP_NUMBER,
+        destination: phone,
+        text: texto,
       });
     } catch (err) {
       console.error('Failed to send message via Gupshup:', err.message);
+      // Se quiser sinalizar pro painel que precisa template:
+      // return res.status(409).json({ error: 'window_24h', detail: err.message });
     }
+  } else {
+    console.error('No token for instance', instanceId);
   }
 
   try {
@@ -136,7 +180,7 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
       resposta_robo: null,
       resposta_atendente: texto,
       remetente: 'Atendente',
-      status_atendimento: 'EM_ATENDIMENTO',
+      status_atendimento: 'EM_ATENDIMENTO (HUMANO)',
     });
     return res.json({ success: true });
   } catch (err) {
@@ -144,21 +188,86 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
     return res.status(500).json({ error: 'Failed to save message' });
   }
 });
+
+// (Opcional) endpoint direto para envio do atendente (sem amarrar a instance via URL)
+app.post('/api/agent/reply', jsonParser, async (req, res) => {
+  const { chatId, text, instanceId, nomePaciente } = req.body;
+  if (!chatId || !text) return res.status(400).json({ error: 'chatId and text are required' });
+  const phone = normalizePhone(chatId);
+
+  let token = null;
+  if (instanceId != null) {
+    token = instanceTokens[String(instanceId)];
+    if (!token) {
+      const { data } = await supabase.from('instances').select('token').eq('id_da_instancia', String(instanceId)).single();
+      token = data ? data.token : null;
+      if (token) instanceTokens[String(instanceId)] = token;
+    }
+  } else {
+    // fallback: tenta pegar a última instance usada pelo número
+    const { data } = await supabase
+      .from('messages')
+      .select('instance_id')
+      .eq('numero_paciente', phone)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const lastInstanceId = data?.instance_id || '0';
+    token = instanceTokens[String(lastInstanceId)];
+    if (!token) {
+      const { data: inst } = await supabase.from('instances').select('token').eq('id_da_instancia', String(lastInstanceId)).single();
+      token = inst ? inst.token : null;
+      if (token) instanceTokens[String(lastInstanceId)] = token;
+    }
+  }
+
+  if (token) {
+    try {
+      await sendWhatsAppSessionMessage({
+        token,
+        source: process.env.GSWHATSAPP_NUMBER,
+        destination: phone,
+        text,
+      });
+    } catch (err) {
+      console.error('Failed to send message via Gupshup:', err.message);
+    }
+  }
+
+  try {
+    await supabase.from('messages').insert({
+      instance_id: String(instanceId || '0'),
+      numero_paciente: phone,
+      nome_paciente: nomePaciente || null,
+      mensagem_paciente: null,
+      resposta_robo: null,
+      resposta_atendente: text,
+      remetente: 'Atendente',
+      status_atendimento: 'EM_ATENDIMENTO (HUMANO)',
+    });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Failed to log agent reply:', err.message);
+    return res.status(500).json({ error: 'Failed to log agent reply' });
+  }
+});
+
+// ---------------- WEBHOOK (Make/Gupshup) ----------------
 // Webhook com JSON.parse manual (evita erro na 2ª ou 3ª mensagem)
 app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
   let body;
-try {
-  // Limpa caracteres de controle antes do parse
-  const cleaned = req.body.replace(/[\u0000-\u001F\u007F]/g, '');
-  body = JSON.parse(cleaned);
-} catch (e) {
-  console.error('❌ JSON malformado:', e.message);
-  return res.status(400).json({ error: 'JSON malformado' });
-}
+  try {
+    // Limpa caracteres de controle antes do parse
+    const cleaned = String(req.body || '').replace(/[\u0000-\u001F\u007F]/g, '');
+    body = JSON.parse(cleaned);
+  } catch (e) {
+    console.error('❌ JSON malformado:', e.message);
+    return res.status(400).json({ error: 'JSON malformado' });
+  }
 
   try {
     const instanceId = body.instanceId || '0';
-    const numeroPaciente = body.numeroPaciente;
+    const numeroPaciente = normalizePhone(body.numeroPaciente);
     const mensagemPaciente = body.mensagemPaciente;
     const respostaRobo = body.respostaRobo || null;
     const patientName = body.nomePaciente || body.nome_paciente || null;
@@ -167,21 +276,22 @@ try {
       return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
     }
 
+    // Último status
     const lastInfo = await getLastMessageInfo(numeroPaciente);
     const lastStatus = lastInfo.status_atendimento;
     const lastRemetente = lastInfo.remetente;
 
+    // Se última foi do atendente, mantemos PENDENTE (fila humana)
     let patientStatus;
-    if (
-      lastStatus === 'PENDENTE' ||
-      (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente')
-    ) {
+    if (lastStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente') || lastStatus === 'EM_ATENDIMENTO (HUMANO)') {
       patientStatus = 'PENDENTE';
+    } else if (lastStatus === 'FINALIZADO') {
+      patientStatus = 'FINALIZADO';
     } else {
       patientStatus = 'EM_ATENDIMENTO';
     }
 
-    // Mensagem do paciente
+    // 1) Loga mensagem do Paciente
     await supabase.from('messages').insert({
       instance_id: String(instanceId),
       numero_paciente: numeroPaciente,
@@ -193,14 +303,16 @@ try {
       status_atendimento: patientStatus,
     });
 
-    // Resposta da IA
+    // 2) Se tiver resposta do robô, avalia se pode gravar / atualizar status
     if (respostaRobo) {
       const normalized = normaliseString(respostaRobo);
       const transferKey = 'transferir para um atendente humano';
 
-      const skipRobot =
-        patientStatus === 'PENDENTE' ||
-        (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente');
+      // Se já está PENDENTE ou FINALIZADO, não grava resposta do robô (desliga robô)
+      if (patientStatus === 'PENDENTE' || patientStatus === 'FINALIZADO') {
+        console.log('Robô suprimido (status atual impede resposta).');
+        return res.json({ received: true, suppressed: true });
+      }
 
       const respostaData = {
         instance_id: String(instanceId),
@@ -210,12 +322,13 @@ try {
         resposta_robo: respostaRobo,
         resposta_atendente: null,
         remetente: 'Robô',
-        status_atendimento: skipRobot ? 'PENDENTE' : 'EM_ATENDIMENTO',
+        status_atendimento: 'EM_ATENDIMENTO',
       };
 
       await supabase.from('messages').insert(respostaData);
 
-      if (!skipRobot && normalized.includes(transferKey)) {
+      // Detecta transferência e põe PENDENTE em todas as mensagens desse número
+      if (normalized.includes(transferKey)) {
         await supabase
           .from('messages')
           .update({ status_atendimento: 'PENDENTE' })
@@ -229,6 +342,8 @@ try {
     return res.status(500).json({ error: 'Webhook insert failed' });
   }
 });
+
+// ---------------- Consultas/Operações de Conversa ----------------
 // Lista de conversas agrupadas por número
 app.get('/api/conversations', async (req, res) => {
   try {
@@ -247,7 +362,7 @@ app.get('/api/conversations', async (req, res) => {
           const normalized = normaliseString(msg.resposta_robo);
           if (normalized.includes('transferir para um atendente humano')) status = 'PENDENTE';
         }
-
+        // Ajuste de rotulagem
         let lastRemetente = msg.remetente;
         if (status === 'PENDENTE') lastRemetente = 'Paciente';
         else if (status === 'FINALIZADO') lastRemetente = 'Finalizado';
@@ -255,8 +370,7 @@ app.get('/api/conversations', async (req, res) => {
         convoMap[key] = {
           numeroPaciente: msg.numero_paciente,
           nomePaciente: msg.nome_paciente || null,
-          lastMessage:
-            msg.mensagem_paciente || msg.resposta_robo || msg.resposta_atendente,
+          lastMessage: msg.mensagem_paciente || msg.resposta_robo || msg.resposta_atendente,
           statusAtendimento: status,
           lastRemetente: lastRemetente,
           updatedAt: msg.updated_at,
@@ -274,7 +388,7 @@ app.get('/api/conversations', async (req, res) => {
 
 // Histórico de mensagens de um número
 app.get('/api/conversation/:numero/messages', async (req, res) => {
-  const numero = req.params.numero;
+  const numero = normalizePhone(req.params.numero);
   try {
     const { data, error } = await supabase
       .from('messages')
@@ -291,10 +405,9 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
 
 // Atualiza status de uma conversa (Finalizar ou reabrir)
 app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
-  const numero = req.params.numero;
+  const numero = normalizePhone(req.params.numero);
   const { statusAtendimento } = req.body;
-  if (!statusAtendimento)
-    return res.status(400).json({ error: 'statusAtendimento is required' });
+  if (!statusAtendimento) return res.status(400).json({ error: 'statusAtendimento is required' });
 
   try {
     const { error } = await supabase
@@ -311,10 +424,9 @@ app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
 
 // Atualiza nome do paciente
 app.patch('/api/conversation/:numero/name', jsonParser, async (req, res) => {
-  const numero = req.params.numero;
+  const numero = normalizePhone(req.params.numero);
   const { nomePaciente } = req.body;
-  if (!nomePaciente)
-    return res.status(400).json({ error: 'nomePaciente is required' });
+  if (!nomePaciente) return res.status(400).json({ error: 'nomePaciente is required' });
 
   try {
     const { error } = await supabase
@@ -328,7 +440,8 @@ app.patch('/api/conversation/:numero/name', jsonParser, async (req, res) => {
     return res.status(500).json({ error: 'Failed to update name' });
   }
 });
-// Inicia servidor
+
+// ---------- Start ----------
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
