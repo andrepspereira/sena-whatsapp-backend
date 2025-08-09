@@ -1,21 +1,14 @@
 /*
   Projeto SENA — Backend (server.js)
-  Versão: v11c (2025-08-09) — Compat CommonJS (axios) + suas rotas atuais
+  Versão: v11d (2025-08-09) — Compat CommonJS (axios) + suas rotas atuais
 
-  O que traz de novo mantendo compatibilidade:
+  Novidades principais (mantendo compat):
   • status_conversa gravado em TODAS as linhas (histórico usa isso no topo)
   • Header X-Conversation-Status no histórico
-  • Robô BLOQUEADO quando conversa está PENDENTE/FINALIZADO (no /api/webhook)
+  • Robô BLOQUEADO quando conversa está PENDENTE/FINALIZADO
   • Envio humano só grava se Gupshup retornar 2xx
   • Handoff/transferência atualiza em massa (status_atendimento + status_conversa + updated_at)
-  • Fallback de nomes de campos (numeroPaciente/numero_paciente, nomePaciente/nome_paciente) como seu front usa
-
-  Variáveis de ambiente:
-  - PORT
-  - SUPABASE_URL
-  - SUPABASE_ANON_KEY (mantido para compat; ideal é usar service_role em produção)
-  - GSAPP_NAME (opcional, nome do app no Gupshup)
-  - GSWHATSAPP_NUMBER ou GSWHATSAPP_NUMBER_<id>
+  • Fallback de nomes (numeroPaciente/numero_paciente, nomePaciente/nome_paciente)
 */
 
 const express = require('express');
@@ -67,12 +60,12 @@ const TRANSFER_TRIGGERS = [
   'vou te deixar com alguem da equipe',
 ];
 
-// FSM — próximo status quando o PACIENTE fala
+/* =========== FSM — status quando o PACIENTE fala (conservador) =========== */
 function nextStatusOnPatient({ lastStatus, lastSender }) {
   switch (lastStatus) {
     case Status.FINALIZADO: return Status.ROBO;        // reabre com robô
-    case Status.PENDENTE:   return Status.PENDENTE;    // esperando humano
-    case Status.HUMANO:     return Status.PENDENTE;    // humano falou por último → volta pra fila humana
+    case Status.PENDENTE:   return Status.PENDENTE;    // aguardando humano
+    case Status.HUMANO:     return Status.PENDENTE;    // paciente respondeu durante HUMANO -> volta à fila humana
     case Status.ROBO:       return Status.ROBO;        // segue com robô
     default:                return Status.ROBO;        // primeira interação
   }
@@ -120,7 +113,6 @@ async function setConversationStatusMass(numeroPaciente, statusKey) {
     .update({ status_atendimento: statusKey, status_conversa: statusKey, updated_at: nowIso() })
     .eq('numero_paciente', numeroPaciente);
 }
-
 async function insertMessage(row) {
   const payload = { ...row, created_at: nowIso(), updated_at: nowIso() };
   const { error } = await supabase.from('messages').insert(payload);
@@ -149,7 +141,7 @@ async function sendWhatsAppSessionMessage({ token, source, destination, text }) 
 }
 
 /* ============================== API =============================== */
-app.get('/health', (req, res) => res.json({ ok: true, version: 'v11c', ts: nowIso() }));
+app.get('/health', (req, res) => res.json({ ok: true, version: 'v11d', ts: nowIso() }));
 
 // Instâncias
 app.get('/api/instances', async (req, res) => {
@@ -281,7 +273,7 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
         return res.json({ received: true, suppressed: true });
       }
 
-      // Insere resposta do robô com status atual
+      // Insere resposta do robô com status atual (ou PENDENTE se gatilho)
       let statusForBot = Status.ROBO;
       if (TRANSFER_TRIGGERS.some(t => normalized.includes(t))) {
         statusForBot = Status.PENDENTE;
@@ -369,11 +361,14 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
 // Finalizar/Reabrir/Pendente/Humano — ATUALIZA EM MASSA (compat com teu front)
 app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
   const numero = normalizePhone(req.params.numero);
-  const { statusAtendimento } = req.body || {};
-  if (!statusAtendimento) return res.status(400).json({ error: 'statusAtendimento is required' });
+  const { statusAtendimento, status } = req.body || {};
+  const desired = statusAtendimento || status;
+  if (!desired || !Object.values(Status).includes(desired)) {
+    return res.status(400).json({ error: 'statusAtendimento/status inválido' });
+  }
 
   try {
-    await setConversationStatusMass(numero, statusAtendimento);
+    await setConversationStatusMass(numero, desired);
     return res.json({ success: true });
   } catch (err) { console.error('Failed to update status:', err.message); return res.status(500).json({ error: 'Failed to update status' }); }
 });
@@ -393,4 +388,4 @@ app.patch('/api/conversation/:numero/name', jsonParser, async (req, res) => {
 
 /* ============================== Start ============================== */
 const port = process.env.PORT || 3000;
-app.listen(port, () => { console.log(`Server v11c running on port ${port}`); });
+app.listen(port, () => { console.log(`Server v11d running on port ${port}`); });
