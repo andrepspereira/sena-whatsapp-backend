@@ -79,7 +79,6 @@ const instanceMeta = {}; // { [id]: { token, source_number } }
 
 async function preloadInstances() {
   try {
-    // se não tiver source_number na tabela, tudo bem; cairemos nas ENVs
     const { data } = await supabase.from('instances').select('id_da_instancia, token, source_number');
     if (data) {
       data.forEach((row) => {
@@ -175,7 +174,7 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
       });
     } catch (err) {
       console.error('Failed to send message via Gupshup:', err.message);
-      // se precisar sinalizar para a UI: return res.status(502).json({ error: 'gupshup_fail', detail: err.message });
+      // Se quiser: return res.status(502).json({ error: 'gupshup_fail', detail: err.message });
     }
   } else {
     console.error('Missing token/source for instance', instanceId, meta);
@@ -248,7 +247,6 @@ app.post('/api/agent/reply', jsonParser, async (req, res) => {
 });
 
 /* ============================ WEBHOOK ============================== */
-// Recebe do Make/Gupshup
 app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
   let body;
   try {
@@ -270,12 +268,12 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
       return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
     }
 
-    // Último status
+    // Último status/remetente ANTES desta mensagem
     const lastInfo = await getLastMessageInfo(numeroPaciente);
     const lastStatus = lastInfo.status_atendimento;
     const lastRemetente = lastInfo.remetente;
 
-    // Define status desta mensagem do paciente
+    // status deste registro da msg do paciente
     let patientStatus;
     if (lastStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente')) {
       patientStatus = 'PENDENTE';
@@ -285,7 +283,7 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
       patientStatus = 'EM_ATENDIMENTO';
     }
 
-    // 1) Grava mensagem do paciente
+    // 1) grava mensagem do paciente
     await supabase.from('messages').insert({
       instance_id: instanceId,
       numero_paciente: numeroPaciente,
@@ -297,17 +295,21 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
       status_atendimento: patientStatus,
     });
 
-    // 2) Grava resposta do robô (se houver) — respeitando status
+    // 2) resposta do robô (se houver)
     if (respostaRobo) {
       const normalized = normaliseString(respostaRobo);
       const transferKey = 'transferir para um atendente humano';
 
-      // Se já está PENDENTE/FINALIZADO → não grava resposta do robô
-      if (patientStatus === 'PENDENTE' || patientStatus === 'FINALIZADO') {
-        console.log('Robô suprimido (status impede resposta).');
+      // SUPRESSÃO MAIS PRECISA:
+      // Só suprime se for handoff real (último status = PENDENTE e último remetente = Robô)
+      // ou se a conversa estiver FINALIZADO.
+      const isRealHandoff = lastStatus === 'PENDENTE' && lastRemetente === 'Robô';
+      if (isRealHandoff || patientStatus === 'FINALIZADO') {
+        console.log('Robô suprimido (handoff real ou conversa finalizada).');
         return res.json({ received: true, suppressed: true });
       }
 
+      // grava resposta do robô normalmente
       await supabase.from('messages').insert({
         instance_id: instanceId,
         numero_paciente: numeroPaciente,
@@ -319,7 +321,7 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
         status_atendimento: 'EM_ATENDIMENTO',
       });
 
-      // Detecta transferência pela frase e marca PENDENTE
+      // detecta transferência e marca PENDENTE em todas as msgs do número
       if (normalized.includes(transferKey)) {
         await supabase
           .from('messages')
