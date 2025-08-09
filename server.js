@@ -22,11 +22,7 @@ app.use((req, res, next) => {
 
 /* ============================== Utils ============================== */
 function normaliseString(str = '') {
-  return String(str)
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[.!?]/g, '');
+  return String(str).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[.!?]/g, '');
 }
 function normalizePhone(p) { return String(p || '').replace(/[^\d]/g, ''); }
 function envSourceForInstance(id) { return process.env[`GSWHATSAPP_NUMBER_${String(id)}`] || process.env.GSWHATSAPP_NUMBER || ''; }
@@ -198,9 +194,7 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
 
     // Se ficou PENDENTE/FINALIZADO, desliga robô e SINCRONIZA (massa)
     if (patientStatus === 'PENDENTE' || patientStatus === 'FINALIZADO') {
-      await supabase.from('messages')
-        .update({ status_atendimento: patientStatus })
-        .eq('numero_paciente', numeroPaciente);
+      await supabase.from('messages').update({ status_atendimento: patientStatus }).eq('numero_paciente', numeroPaciente);
     }
 
     // 2) ROBÔ respondeu?
@@ -240,7 +234,7 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
 app.get('/api/conversations', async (req, res) => {
   try {
     const { data, error } = await supabase.from('messages').select('*').order('created_at', { ascending: true });
-    if (error) throw error;
+  if (error) throw error;
 
     const byNumero = new Map();
     for (const msg of data) {
@@ -273,10 +267,11 @@ app.get('/api/conversations', async (req, res) => {
   } catch (err) { console.error('Failed to fetch conversations:', err.message); return res.status(500).json({ error: 'Failed to fetch conversations' }); }
 });
 
-// Histórico completo — ULTRA COMPAT: TODAS as mensagens com status/remetente canônicos
+// Histórico completo — preserva mensagens; adiciona status_conversa (sem quebrar alinhamento)
 app.get('/api/conversation/:numero/messages', async (req, res) => {
   const numero = normalizePhone(req.params.numero);
   try {
+    // histórico ascendente
     const { data, error } = await supabase
       .from('messages')
       .select('*')
@@ -284,16 +279,9 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
       .order('created_at', { ascending: true });
     if (error) throw error;
 
-    // status atual pela ÚLTIMA linha real
-    const { data: lastArr, error: e2 } = await supabase
-      .from('messages')
-      .select('status_atendimento')
-      .eq('numero_paciente', numero)
-      .order('created_at', { ascending: false })
-      .limit(1);
-    if (e2) throw e2;
-
-    const statusAtual = (lastArr && lastArr[0] && lastArr[0].status_atendimento) || 'EM_ATENDIMENTO_ROBO';
+    // status atual (última linha real)
+    const last = await getLastRow(numero);
+    const statusAtual = last?.status_atendimento || 'EM_ATENDIMENTO_ROBO';
 
     const headerSenderByStatus = {
       'PENDENTE': 'Paciente',
@@ -303,20 +291,14 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
     };
     const headerSender = headerSenderByStatus[statusAtual] || 'Robô';
 
-    // 🚨 ULTRA COMPAT: força em TODAS as mensagens (só na resposta)
-    const out = data.map(m => ({
-      ...m,
-      status_atendimento: statusAtual,
-      remetente: headerSender,
-    }));
+    // 🔧 Sem mexer em remetente/status_atendimento originais!
+    const out = data.map(m => ({ ...m, status_conversa: statusAtual }));
 
-    // anti-cache (garante atualização)
+    // No-cache e headers de debug
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
     res.setHeader('Surrogate-Control', 'no-store');
-
-    // headers auxiliares pra debug
     res.setHeader('X-Conversation-Status', statusAtual);
     res.setHeader('X-Conversation-Remetente', headerSender);
 
@@ -327,7 +309,7 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
   }
 });
 
-// Finalizar/Reabrir — ATUALIZA EM MASSA (compatível com teu front)
+// Finalizar/Reabrir — ATUALIZA EM MASSA (compat com teu front)
 app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
   const numero = normalizePhone(req.params.numero);
   const { statusAtendimento } = req.body;
