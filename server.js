@@ -273,11 +273,11 @@ app.get('/api/conversations', async (req, res) => {
   } catch (err) { console.error('Failed to fetch conversations:', err.message); return res.status(500).json({ error: 'Failed to fetch conversations' }); }
 });
 
-// Histórico completo — COMPAT MODE: todas as mensagens com o status ATUAL
+// Histórico completo — COMPAT HARD: última mensagem carrega status/remetente canônicos
 app.get('/api/conversation/:numero/messages', async (req, res) => {
   const numero = normalizePhone(req.params.numero);
   try {
-    // 1) histórico ascendente
+    // 1) histórico ascendente (como o front espera)
     const { data, error } = await supabase
       .from('messages')
       .select('*')
@@ -285,7 +285,7 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
       .order('created_at', { ascending: true });
     if (error) throw error;
 
-    // 2) status ATUAL (última linha real)
+    // 2) pega a ÚLTIMA linha real pra status atual
     const { data: lastArr, error: e2 } = await supabase
       .from('messages')
       .select('status_atendimento')
@@ -294,12 +294,27 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
       .limit(1);
     if (e2) throw e2;
 
-    const statusAtual =
-      (lastArr && lastArr[0] && lastArr[0].status_atendimento) ||
-      'EM_ATENDIMENTO_ROBO';
+    const statusAtual = (lastArr && lastArr[0] && lastArr[0].status_atendimento) || 'EM_ATENDIMENTO_ROBO';
 
-    // 3) injeta statusAtual em TODAS as mensagens (compat front)
-    const out = data.map(m => ({ ...m, status_atendimento: statusAtual }));
+    // 3) define remetente "canônico" pro cabeçalho conforme o status
+    const headerSenderByStatus = {
+      'PENDENTE': 'Paciente',
+      'EM_ATENDIMENTO_HUMANO': 'Atendente',
+      'EM_ATENDIMENTO_ROBO': 'Robô',
+      'FINALIZADO': 'Finalizado'
+    };
+    const headerSender = headerSenderByStatus[statusAtual] || 'Robô';
+
+    // 4) COMPAT HARD: ajusta SÓ o último item (sem tocar no banco)
+    const out = data.slice();
+    if (out.length) {
+      const last = out[out.length - 1];
+      out[out.length - 1] = {
+        ...last,
+        status_atendimento: statusAtual,
+        remetente: headerSender,
+      };
+    }
 
     res.setHeader('X-Conversation-Status', statusAtual);
     return res.json(out);
