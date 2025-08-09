@@ -1,4 +1,3 @@
-// ... (o começo permanece igual ao último que te mandei) ...
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
@@ -40,11 +39,11 @@ function envSourceForInstance(id) {
 // FSM — próximo status quando o PACIENTE fala
 function nextStatusOnPatient({ lastStatus, lastSender }) {
   switch (lastStatus) {
-    case 'FINALIZADO':            return 'EM_ATENDIMENTO_ROBO';
-    case 'PENDENTE':              return 'PENDENTE';
-    case 'EM_ATENDIMENTO_HUMANO': return 'PENDENTE';
+    case 'FINALIZADO':            return 'EM_ATENDIMENTO_ROBO'; // reabre com robô
+    case 'PENDENTE':              return 'PENDENTE';            // espera humano
+    case 'EM_ATENDIMENTO_HUMANO': return 'PENDENTE';            // humano falou por último → volta pra fila humana
     case 'EM_ATENDIMENTO_ROBO':   return 'EM_ATENDIMENTO_ROBO';
-    default:                      return 'EM_ATENDIMENTO_ROBO';
+    default:                      return 'EM_ATENDIMENTO_ROBO'; // primeira interação
   }
 }
 
@@ -85,7 +84,7 @@ async function getLastMessageInfo(numeroPaciente) {
 async function getThreadSummary(numeroPaciente) {
   const { data } = await supabase
     .from('messages')
-    .select('status_atendimento, remetente, mensagem_paciente, resposta_robo, resposta_atendente, updated_at, instance_id, nome_paciente')
+    .select('status_atendimento, remetente, mensagem_paciente, resposta_robo, resposta_atendente, updated_at, instance_id, nome_paciente, created_at')
     .eq('numero_paciente', numeroPaciente)
     .order('created_at', { ascending: false })
     .limit(1);
@@ -100,10 +99,11 @@ async function getThreadSummary(numeroPaciente) {
     updatedAt: last.updated_at,
     instanceId: last.instance_id,
     nomePaciente: last.nome_paciente || null,
+    createdAt: last.created_at,
   };
 }
 
-// cache por instância: token + source_number
+// cache por instância
 const instanceMeta = {}; // { [id]: { token, source_number } }
 
 async function preloadInstances() {
@@ -123,6 +123,7 @@ async function preloadInstances() {
 preloadInstances();
 
 /* ============================== API =============================== */
+// Instâncias
 app.get('/api/instances', async (req, res) => {
   const count = Number(process.env.INSTANCE_COUNT || 8);
   const list = [];
@@ -169,6 +170,7 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
     console.error('Missing token/source for instance', instanceId, meta);
   }
 
+  // grava mensagem do HUMANO
   try {
     await supabase.from('messages').insert({
       instance_id: instanceId,
@@ -184,7 +186,7 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
   } catch (err) { console.error('Failed to insert attendant message:', err.message); return res.status(500).json({ error: 'Failed to save message' }); }
 });
 
-// (Opcional) endpoint direto pro painel
+// (Opcional) envio direto
 app.post('/api/agent/reply', jsonParser, async (req, res) => {
   const { chatId, text, instanceId, nomePaciente } = req.body;
   const phone = normalizePhone(chatId);
@@ -198,9 +200,8 @@ app.post('/api/agent/reply', jsonParser, async (req, res) => {
   }
 
   if (meta.token) {
-    try {
-      await sendWhatsAppSessionMessage({ token: meta.token, source: meta.source_number || envSourceForInstance(iid), destination: phone, text });
-    } catch (err) { console.error('Failed to send message via Gupshup:', err.message); }
+    try { await sendWhatsAppSessionMessage({ token: meta.token, source: meta.source_number || envSourceForInstance(iid), destination: phone, text }); }
+    catch (err) { console.error('Failed to send message via Gupshup:', err.message); }
   }
 
   try {
@@ -264,8 +265,18 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
         remetente: 'Robô', status_atendimento: 'EM_ATENDIMENTO_ROBO',
       });
 
+      // Transferência ⇒ em vez de UPDATE em massa, INSERIMOS uma linha “Sistema” PENDENTE
       if (normalized.includes(transferKey)) {
-        await supabase.from('messages').update({ status_atendimento: 'PENDENTE' }).eq('numero_paciente', numeroPaciente);
+        await supabase.from('messages').insert({
+          instance_id: instanceId,
+          numero_paciente: numeroPaciente,
+          nome_paciente: patientName,
+          mensagem_paciente: null,
+          resposta_robo: null,
+          resposta_atendente: null,
+          remetente: 'Sistema',
+          status_atendimento: 'PENDENTE',
+        });
       }
     }
 
@@ -274,6 +285,7 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
 });
 
 /* =================== Consultas para o painel/UI =================== */
+// Lista de conversas (uma por número) — última linha manda
 app.get('/api/conversations', async (req, res) => {
   try {
     const { data, error } = await supabase.from('messages').select('*').order('created_at', { ascending: true });
@@ -310,7 +322,7 @@ app.get('/api/conversations', async (req, res) => {
   } catch (err) { console.error('Failed to fetch conversations:', err.message); return res.status(500).json({ error: 'Failed to fetch conversations' }); }
 });
 
-// >>> NOVO: status canônico da conversa
+// Status canônico
 app.get('/api/conversation/:numero/status', async (req, res) => {
   const numero = normalizePhone(req.params.numero);
   try {
@@ -320,25 +332,66 @@ app.get('/api/conversation/:numero/status', async (req, res) => {
   } catch (err) { console.error('Failed to fetch conversation status:', err.message); return res.status(500).json({ error: 'Failed to fetch conversation status' }); }
 });
 
-// Histórico completo (com opção de wrapper p/ status canônico)
+// Histórico completo (API agora “normaliza” o status na resposta)
 app.get('/api/conversation/:numero/messages', async (req, res) => {
   const numero = normalizePhone(req.params.numero);
-  const wrap = String(req.query.wrap || '').toLowerCase() === '1';
   try {
-    const { data, error } = await supabase.from('messages').select('*').eq('numero_paciente', numero).order('created_at', { ascending: true });
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('numero_paciente', numero)
+      .order('created_at', { ascending: true });
     if (error) throw error;
 
-    if (!wrap) {
-      // retrocompatível
-      // também mandamos um header com o status canônico pra facilitar no front atual
-      const summary = await getThreadSummary(numero);
-      if (summary?.statusAtual) res.setHeader('X-Conversation-Status', summary.statusAtual);
-      return res.json(data);
-    }
-
     const summary = await getThreadSummary(numero);
-    return res.json({ statusAtual: summary?.statusAtual || 'EM_ATENDIMENTO_ROBO', lastRemetente: summary?.lastRemetente || null, messages: data });
+    const statusAtual = summary?.statusAtual || 'EM_ATENDIMENTO_ROBO';
+
+    // ⚠️ Normalização só na resposta (não altera o banco):
+    const normalized = data.map(m => ({ ...m, status_atendimento: statusAtual }));
+
+    // Header auxiliar pro front atual (se quiser usar)
+    res.setHeader('X-Conversation-Status', statusAtual);
+    return res.json(normalized);
   } catch (err) { console.error('Failed to fetch conversation:', err.message); return res.status(500).json({ error: 'Failed to fetch conversation' }); }
+});
+
+// Finalizar/Reabrir (insere uma linha “Sistema” com o novo status)
+app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
+  const numero = normalizePhone(req.params.numero);
+  const { statusAtendimento } = req.body;
+  if (!statusAtendimento) return res.status(400).json({ error: 'statusAtendimento is required' });
+
+  try {
+    // mantém compatibilidade (atualiza em massa, se quiser)
+    await supabase.from('messages').update({ status_atendimento: statusAtendimento }).eq('numero_paciente', numero);
+
+    // insere uma linha final para refletir o estado atual (UI pega essa como última)
+    await supabase.from('messages').insert({
+      instance_id: '0',
+      numero_paciente: numero,
+      nome_paciente: null,
+      mensagem_paciente: null,
+      resposta_robo: null,
+      resposta_atendente: null,
+      remetente: 'Sistema',
+      status_atendimento: statusAtendimento,
+    });
+
+    return res.json({ success: true });
+  } catch (err) { console.error('Failed to update status:', err.message); return res.status(500).json({ error: 'Failed to update status' }); }
+});
+
+// Atualiza nome
+app.patch('/api/conversation/:numero/name', jsonParser, async (req, res) => {
+  const numero = normalizePhone(req.params.numero);
+  const { nomePaciente } = req.body;
+  if (!nomePaciente) return res.status(400).json({ error: 'nomePaciente is required' });
+
+  try {
+    const { error } = await supabase.from('messages').update({ nome_paciente: nomePaciente }).eq('numero_paciente', numero);
+    if (error) throw error;
+    return res.json({ success: true });
+  } catch (err) { console.error('Failed to update name:', err.message); return res.status(500).json({ error: 'Failed to update name' }); }
 });
 
 /* ============================== Start ============================== */
