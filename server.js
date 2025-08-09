@@ -22,7 +22,9 @@ app.use((req, res, next) => {
 
 /* ============================== Utils ============================== */
 function normaliseString(str = '') {
-  return String(str).toLowerCase().normalize('NFD')
+  return String(str)
+    .toLowerCase()
+    .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[.!?]/g, '');
 }
@@ -218,7 +220,7 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
         remetente: 'Robô', status_atendimento: 'EM_ATENDIMENTO_ROBO',
       });
 
-      // PATCH #2 — Transferência: marca TUDO como PENDENTE e força updated_at “agora”
+      // Transferência: marca TUDO como PENDENTE e força updated_at “agora”
       if (normalized.includes(transferKey)) {
         await supabase.from('messages')
           .update({
@@ -271,11 +273,11 @@ app.get('/api/conversations', async (req, res) => {
   } catch (err) { console.error('Failed to fetch conversations:', err.message); return res.status(500).json({ error: 'Failed to fetch conversations' }); }
 });
 
-// Histórico completo (PATCH #1: força status correto na ÚLTIMA mensagem)
+// Histórico completo — COMPAT MODE: todas as mensagens com o status ATUAL
 app.get('/api/conversation/:numero/messages', async (req, res) => {
   const numero = normalizePhone(req.params.numero);
   try {
-    // histórico em ordem crescente
+    // 1) histórico ascendente
     const { data, error } = await supabase
       .from('messages')
       .select('*')
@@ -283,13 +285,21 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
       .order('created_at', { ascending: true });
     if (error) throw error;
 
-    // pega status atual pela ÚLTIMA linha
-    const last = await getLastRow(numero);
-    const statusAtual = last?.status_atendimento || 'EM_ATENDIMENTO_ROBO';
+    // 2) status ATUAL (última linha real)
+    const { data: lastArr, error: e2 } = await supabase
+      .from('messages')
+      .select('status_atendimento')
+      .eq('numero_paciente', numero)
+      .order('created_at', { ascending: false })
+      .limit(1);
+    if (e2) throw e2;
 
-    // força SÓ a última mensagem a carregar o status atual (não mexe no banco)
-    const out = data.slice();
-    if (out.length) out[out.length - 1] = { ...out[out.length - 1], status_atendimento: statusAtual };
+    const statusAtual =
+      (lastArr && lastArr[0] && lastArr[0].status_atendimento) ||
+      'EM_ATENDIMENTO_ROBO';
+
+    // 3) injeta statusAtual em TODAS as mensagens (compat front)
+    const out = data.map(m => ({ ...m, status_atendimento: statusAtual }));
 
     res.setHeader('X-Conversation-Status', statusAtual);
     return res.json(out);
