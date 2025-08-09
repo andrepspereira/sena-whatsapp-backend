@@ -36,6 +36,23 @@ function envSourceForInstance(id) {
   return process.env[k] || process.env.GSWHATSAPP_NUMBER || '';
 }
 
+// FSM — próximo status quando o PACIENTE fala
+function nextStatusOnPatient({ lastStatus, lastSender }) {
+  switch (lastStatus) {
+    case 'FINALIZADO':
+      return 'EM_ATENDIMENTO_ROBO';            // reabre com robô
+    case 'PENDENTE':
+      return 'PENDENTE';                        // continua esperando humano (robô off)
+    case 'EM_ATENDIMENTO_HUMANO':
+      return 'PENDENTE';                        // humano falou por último, paciente chamou → volta pra fila humana
+    case 'EM_ATENDIMENTO_ROBO':
+      // segue com robô atendendo
+      return 'EM_ATENDIMENTO_ROBO';
+    default:
+      return 'EM_ATENDIMENTO_ROBO';             // default: primeira interação
+  }
+}
+
 // Gupshup: mensagem de sessão (texto) — form-urlencoded + message em JSON
 async function sendWhatsAppSessionMessage({ token, source, destination, text }) {
   const body = new URLSearchParams();
@@ -174,13 +191,13 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
       });
     } catch (err) {
       console.error('Failed to send message via Gupshup:', err.message);
-      // Se quiser: return res.status(502).json({ error: 'gupshup_fail', detail: err.message });
+      // Se quiser sinalizar pra UI: return res.status(502).json({ error: 'gupshup_fail', detail: err.message });
     }
   } else {
     console.error('Missing token/source for instance', instanceId, meta);
   }
 
-  // Loga no banco — status padronizado
+  // Loga no banco — humano falando
   try {
     await supabase.from('messages').insert({
       instance_id: instanceId,
@@ -190,7 +207,7 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
       resposta_robo: null,
       resposta_atendente: texto,
       remetente: 'Atendente',
-      status_atendimento: 'EM_ATENDIMENTO',
+      status_atendimento: 'EM_ATENDIMENTO_HUMANO',
     });
     return res.json({ success: true });
   } catch (err) {
@@ -237,7 +254,7 @@ app.post('/api/agent/reply', jsonParser, async (req, res) => {
       resposta_robo: null,
       resposta_atendente: text,
       remetente: 'Atendente',
-      status_atendimento: 'EM_ATENDIMENTO',
+      status_atendimento: 'EM_ATENDIMENTO_HUMANO',
     });
     return res.json({ ok: true });
   } catch (err) {
@@ -247,6 +264,7 @@ app.post('/api/agent/reply', jsonParser, async (req, res) => {
 });
 
 /* ============================ WEBHOOK ============================== */
+// Recebe do Make/Gupshup
 app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
   let body;
   try {
@@ -273,17 +291,9 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
     const lastStatus = lastInfo.status_atendimento;
     const lastRemetente = lastInfo.remetente;
 
-    // status deste registro da msg do paciente
-    let patientStatus;
-    if (lastStatus === 'PENDENTE' || (lastStatus === 'EM_ATENDIMENTO' && lastRemetente === 'Atendente')) {
-      patientStatus = 'PENDENTE';
-    } else if (lastStatus === 'FINALIZADO') {
-      patientStatus = 'FINALIZADO';
-    } else {
-      patientStatus = 'EM_ATENDIMENTO';
-    }
+    // 1) PACIENTE falou → decide status desta linha
+    const patientStatus = nextStatusOnPatient({ lastStatus, lastSender: lastRemetente });
 
-    // 1) grava mensagem do paciente
     await supabase.from('messages').insert({
       instance_id: instanceId,
       numero_paciente: numeroPaciente,
@@ -295,21 +305,17 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
       status_atendimento: patientStatus,
     });
 
-    // 2) resposta do robô (se houver)
+    // 2) ROBÔ respondeu?
     if (respostaRobo) {
       const normalized = normaliseString(respostaRobo);
       const transferKey = 'transferir para um atendente humano';
 
-      // SUPRESSÃO MAIS PRECISA:
-      // Só suprime se for handoff real (último status = PENDENTE e último remetente = Robô)
-      // ou se a conversa estiver FINALIZADO.
-      const isRealHandoff = lastStatus === 'PENDENTE' && lastRemetente === 'Robô';
-      if (isRealHandoff || patientStatus === 'FINALIZADO') {
-        console.log('Robô suprimido (handoff real ou conversa finalizada).');
+      // Robô só pode falar se NÃO estiver PENDENTE/FINALIZADO
+      if (patientStatus === 'PENDENTE' || patientStatus === 'FINALIZADO') {
+        console.log('Robô suprimido (status impede resposta).');
         return res.json({ received: true, suppressed: true });
       }
 
-      // grava resposta do robô normalmente
       await supabase.from('messages').insert({
         instance_id: instanceId,
         numero_paciente: numeroPaciente,
@@ -318,10 +324,10 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
         resposta_robo: respostaRobo,
         resposta_atendente: null,
         remetente: 'Robô',
-        status_atendimento: 'EM_ATENDIMENTO',
+        status_atendimento: 'EM_ATENDIMENTO_ROBO',
       });
 
-      // detecta transferência e marca PENDENTE em todas as msgs do número
+      // Transferência ⇒ marca PENDENTE (desliga robô)
       if (normalized.includes(transferKey)) {
         await supabase
           .from('messages')
@@ -338,7 +344,7 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
 });
 
 /* =================== Consultas para o painel/UI =================== */
-// Lista de conversas (uma por número) — com base NA ÚLTIMA mensagem real
+// Lista de conversas (uma por número) — leva em conta a ÚLTIMA linha
 app.get('/api/conversations', async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -358,24 +364,27 @@ app.get('/api/conversations', async (req, res) => {
 
     const list = [];
     for (const [numero, msg] of byNumero.entries()) {
-      let status = msg.status_atendimento || 'EM_ATENDIMENTO';
-      // se a última foi do robô e contém frase de transferência → PENDENTE
-      if (msg.remetente === 'Robô' && msg.resposta_robo) {
-        const normalized = normaliseString(msg.resposta_robo);
-        if (normalized.includes('transferir para um atendente humano')) status = 'PENDENTE';
-      }
+      // status é o da ÚLTIMA linha
+      const status = msg.status_atendimento || 'EM_ATENDIMENTO_ROBO';
+      // selo legível pra UI (se quiser usar):
+      let label;
+      if (status === 'FINALIZADO') label = 'FINALIZADO';
+      else if (status === 'PENDENTE') label = 'PENDENTE';
+      else if (status === 'EM_ATENDIMENTO_HUMANO') label = 'HUMANO';
+      else label = 'ROBÔ'; // EM_ATENDIMENTO_ROBO
+
       list.push({
         numeroPaciente: numero,
         nomePaciente: msg.nome_paciente || null,
         lastMessage: msg.mensagem_paciente || msg.resposta_robo || msg.resposta_atendente,
         statusAtendimento: status,
-        lastRemetente: msg.remetente, // quem realmente enviou por último
+        lastRemetente: msg.remetente,
+        label, // opcional p/ a UI
         updatedAt: msg.updated_at,
         instanceId: msg.instance_id,
       });
     }
 
-    // ordena desc por updatedAt
     list.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
     return res.json(list);
   } catch (err) {
@@ -401,7 +410,7 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
   }
 });
 
-// Atualiza status (Finalizar/Reabrir)
+// Atualiza status (Finalizar/Reabrir manualmente)
 app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
   const numero = normalizePhone(req.params.numero);
   const { statusAtendimento } = req.body;
