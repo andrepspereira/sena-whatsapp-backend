@@ -1,3 +1,4 @@
+// ... (o começo permanece igual ao último que te mandei) ...
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
@@ -39,21 +40,15 @@ function envSourceForInstance(id) {
 // FSM — próximo status quando o PACIENTE fala
 function nextStatusOnPatient({ lastStatus, lastSender }) {
   switch (lastStatus) {
-    case 'FINALIZADO':
-      return 'EM_ATENDIMENTO_ROBO';            // reabre com robô
-    case 'PENDENTE':
-      return 'PENDENTE';                        // continua esperando humano (robô off)
-    case 'EM_ATENDIMENTO_HUMANO':
-      return 'PENDENTE';                        // humano falou por último, paciente chamou → volta pra fila humana
-    case 'EM_ATENDIMENTO_ROBO':
-      // segue com robô atendendo
-      return 'EM_ATENDIMENTO_ROBO';
-    default:
-      return 'EM_ATENDIMENTO_ROBO';             // default: primeira interação
+    case 'FINALIZADO':            return 'EM_ATENDIMENTO_ROBO';
+    case 'PENDENTE':              return 'PENDENTE';
+    case 'EM_ATENDIMENTO_HUMANO': return 'PENDENTE';
+    case 'EM_ATENDIMENTO_ROBO':   return 'EM_ATENDIMENTO_ROBO';
+    default:                      return 'EM_ATENDIMENTO_ROBO';
   }
 }
 
-// Gupshup: mensagem de sessão (texto) — form-urlencoded + message em JSON
+// Gupshup sessão (texto)
 async function sendWhatsAppSessionMessage({ token, source, destination, text }) {
   const body = new URLSearchParams();
   body.append('channel', 'whatsapp');
@@ -63,11 +58,7 @@ async function sendWhatsAppSessionMessage({ token, source, destination, text }) 
   body.append('src.name', process.env.GSAPP_NAME || 'SENA');
 
   const res = await axios.post('https://api.gupshup.io/wa/api/v1/msg', body, {
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      apikey: token,
-      'cache-control': 'no-cache',
-    },
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', apikey: token, 'cache-control': 'no-cache' },
     timeout: 15000,
     validateStatus: () => true,
   });
@@ -91,6 +82,27 @@ async function getLastMessageInfo(numeroPaciente) {
   return data[0];
 }
 
+async function getThreadSummary(numeroPaciente) {
+  const { data } = await supabase
+    .from('messages')
+    .select('status_atendimento, remetente, mensagem_paciente, resposta_robo, resposta_atendente, updated_at, instance_id, nome_paciente')
+    .eq('numero_paciente', numeroPaciente)
+    .order('created_at', { ascending: false })
+    .limit(1);
+  if (!data || data.length === 0) return null;
+  const last = data[0];
+  const statusAtual = last.status_atendimento || 'EM_ATENDIMENTO_ROBO';
+  const lastMessage = last.mensagem_paciente || last.resposta_robo || last.resposta_atendente || null;
+  return {
+    statusAtual,
+    lastRemetente: last.remetente,
+    lastMessage,
+    updatedAt: last.updated_at,
+    instanceId: last.instance_id,
+    nomePaciente: last.nome_paciente || null,
+  };
+}
+
 // cache por instância: token + source_number
 const instanceMeta = {}; // { [id]: { token, source_number } }
 
@@ -106,14 +118,11 @@ async function preloadInstances() {
         };
       });
     }
-  } catch (err) {
-    console.error('Failed to preload instances:', err.message);
-  }
+  } catch (err) { console.error('Failed to preload instances:', err.message); }
 }
 preloadInstances();
 
 /* ============================== API =============================== */
-// Ver instâncias/tokens/sources
 app.get('/api/instances', async (req, res) => {
   const count = Number(process.env.INSTANCE_COUNT || 8);
   const list = [];
@@ -121,41 +130,21 @@ app.get('/api/instances', async (req, res) => {
     const key = String(i);
     const meta = instanceMeta[key] || {};
     const hasToken = !!meta.token;
-    list.push({
-      id: key,
-      token: hasToken,
-      hasToken,
-      online: hasToken,
-      source: meta.source_number || envSourceForInstance(key) || null,
-    });
+    list.push({ id: key, token: hasToken, hasToken, online: hasToken, source: meta.source_number || envSourceForInstance(key) || null });
   }
   return res.json(list);
 });
 
-// Salvar token (e opcionalmente source_number) da instância
 app.post('/api/instance/:id/token', jsonParser, async (req, res) => {
   const instanceId = String(req.params.id);
   const { token, source_number } = req.body;
   if (!token) return res.status(400).json({ error: 'Token is required' });
-
-  const updates = {
-    id_da_instancia: instanceId,
-    token,
-    source_number: source_number || null,
-    status: 'active',
-    updated_at: new Date().toISOString(),
-  };
+  const updates = { id_da_instancia: instanceId, token, source_number: source_number || null, status: 'active', updated_at: new Date().toISOString() };
   try {
     await supabase.from('instances').upsert(updates, { onConflict: 'id_da_instancia' });
-    instanceMeta[instanceId] = {
-      token,
-      source_number: source_number || envSourceForInstance(instanceId),
-    };
+    instanceMeta[instanceId] = { token, source_number: source_number || envSourceForInstance(instanceId) };
     return res.json({ success: true });
-  } catch (err) {
-    console.error('Failed to upsert token:', err.message);
-    return res.status(500).json({ error: 'Failed to save token' });
-  }
+  } catch (err) { console.error('Failed to upsert token:', err.message); return res.status(500).json({ error: 'Failed to save token' }); }
 });
 
 /* ======================= HUMANO → WHATSAPP ======================== */
@@ -166,38 +155,20 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
   const patientName = nomePaciente || nome_paciente || null;
   if (!phone || !texto) return res.status(400).json({ error: 'numeroPaciente and texto are required' });
 
-  // meta da instância
   let meta = instanceMeta[instanceId];
   if (!meta) {
-    const { data } = await supabase
-      .from('instances')
-      .select('token, source_number')
-      .eq('id_da_instancia', instanceId)
-      .single();
-    meta = instanceMeta[instanceId] = {
-      token: data?.token || null,
-      source_number: data?.source_number || envSourceForInstance(instanceId),
-    };
+    const { data } = await supabase.from('instances').select('token, source_number').eq('id_da_instancia', instanceId).single();
+    meta = instanceMeta[instanceId] = { token: data?.token || null, source_number: data?.source_number || envSourceForInstance(instanceId) };
   }
 
-  // Envia mensagem do humano
   if (meta.token && (meta.source_number || envSourceForInstance(instanceId))) {
     try {
-      await sendWhatsAppSessionMessage({
-        token: meta.token,
-        source: meta.source_number || envSourceForInstance(instanceId),
-        destination: phone,
-        text: texto,
-      });
-    } catch (err) {
-      console.error('Failed to send message via Gupshup:', err.message);
-      // Se quiser sinalizar pra UI: return res.status(502).json({ error: 'gupshup_fail', detail: err.message });
-    }
+      await sendWhatsAppSessionMessage({ token: meta.token, source: meta.source_number || envSourceForInstance(instanceId), destination: phone, text: texto });
+    } catch (err) { console.error('Failed to send message via Gupshup:', err.message); }
   } else {
     console.error('Missing token/source for instance', instanceId, meta);
   }
 
-  // Loga no banco — humano falando
   try {
     await supabase.from('messages').insert({
       instance_id: instanceId,
@@ -210,10 +181,7 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
       status_atendimento: 'EM_ATENDIMENTO_HUMANO',
     });
     return res.json({ success: true });
-  } catch (err) {
-    console.error('Failed to insert attendant message:', err.message);
-    return res.status(500).json({ error: 'Failed to save message' });
-  }
+  } catch (err) { console.error('Failed to insert attendant message:', err.message); return res.status(500).json({ error: 'Failed to save message' }); }
 });
 
 // (Opcional) endpoint direto pro painel
@@ -226,23 +194,13 @@ app.post('/api/agent/reply', jsonParser, async (req, res) => {
   let meta = instanceMeta[iid];
   if (!meta) {
     const { data } = await supabase.from('instances').select('token, source_number').eq('id_da_instancia', iid).single();
-    meta = instanceMeta[iid] = {
-      token: data?.token || null,
-      source_number: data?.source_number || envSourceForInstance(iid),
-    };
+    meta = instanceMeta[iid] = { token: data?.token || null, source_number: data?.source_number || envSourceForInstance(iid) };
   }
 
   if (meta.token) {
     try {
-      await sendWhatsAppSessionMessage({
-        token: meta.token,
-        source: meta.source_number || envSourceForInstance(iid),
-        destination: phone,
-        text,
-      });
-    } catch (err) {
-      console.error('Failed to send message via Gupshup:', err.message);
-    }
+      await sendWhatsAppSessionMessage({ token: meta.token, source: meta.source_number || envSourceForInstance(iid), destination: phone, text });
+    } catch (err) { console.error('Failed to send message via Gupshup:', err.message); }
   }
 
   try {
@@ -257,23 +215,16 @@ app.post('/api/agent/reply', jsonParser, async (req, res) => {
       status_atendimento: 'EM_ATENDIMENTO_HUMANO',
     });
     return res.json({ ok: true });
-  } catch (err) {
-    console.error('Failed to log agent reply:', err.message);
-    return res.status(500).json({ error: 'Failed to log agent reply' });
-  }
+  } catch (err) { console.error('Failed to log agent reply:', err.message); return res.status(500).json({ error: 'Failed to log agent reply' }); }
 });
 
 /* ============================ WEBHOOK ============================== */
-// Recebe do Make/Gupshup
 app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
   let body;
   try {
     const cleaned = String(req.body || '').replace(/[\u0000-\u001F\u007F]/g, '');
     body = JSON.parse(cleaned);
-  } catch (e) {
-    console.error('❌ JSON malformado:', e.message);
-    return res.status(400).json({ error: 'JSON malformado' });
-  }
+  } catch (e) { console.error('❌ JSON malformado:', e.message); return res.status(400).json({ error: 'JSON malformado' }); }
 
   try {
     const instanceId = String(body.instanceId || '0');
@@ -282,27 +233,18 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
     const respostaRobo = body.respostaRobo || null;
     const patientName = body.nomePaciente || body.nome_paciente || null;
 
-    if (!numeroPaciente || !mensagemPaciente) {
-      return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
-    }
+    if (!numeroPaciente || !mensagemPaciente) return res.status(400).json({ error: 'Missing numeroPaciente or mensagemPaciente' });
 
-    // Último status/remetente ANTES desta mensagem
     const lastInfo = await getLastMessageInfo(numeroPaciente);
     const lastStatus = lastInfo.status_atendimento;
     const lastRemetente = lastInfo.remetente;
 
-    // 1) PACIENTE falou → decide status desta linha
+    // 1) PACIENTE falou
     const patientStatus = nextStatusOnPatient({ lastStatus, lastSender: lastRemetente });
-
     await supabase.from('messages').insert({
-      instance_id: instanceId,
-      numero_paciente: numeroPaciente,
-      nome_paciente: patientName,
-      mensagem_paciente: mensagemPaciente,
-      resposta_robo: null,
-      resposta_atendente: null,
-      remetente: 'Paciente',
-      status_atendimento: patientStatus,
+      instance_id: instanceId, numero_paciente: numeroPaciente, nome_paciente: patientName,
+      mensagem_paciente: mensagemPaciente, resposta_robo: null, resposta_atendente: null,
+      remetente: 'Paciente', status_atendimento: patientStatus,
     });
 
     // 2) ROBÔ respondeu?
@@ -310,63 +252,43 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
       const normalized = normaliseString(respostaRobo);
       const transferKey = 'transferir para um atendente humano';
 
-      // Robô só pode falar se NÃO estiver PENDENTE/FINALIZADO
+      // Robô OFF em PENDENTE/FINALIZADO
       if (patientStatus === 'PENDENTE' || patientStatus === 'FINALIZADO') {
         console.log('Robô suprimido (status impede resposta).');
         return res.json({ received: true, suppressed: true });
       }
 
       await supabase.from('messages').insert({
-        instance_id: instanceId,
-        numero_paciente: numeroPaciente,
-        nome_paciente: patientName,
-        mensagem_paciente: null,
-        resposta_robo: respostaRobo,
-        resposta_atendente: null,
-        remetente: 'Robô',
-        status_atendimento: 'EM_ATENDIMENTO_ROBO',
+        instance_id: instanceId, numero_paciente: numeroPaciente, nome_paciente: patientName,
+        mensagem_paciente: null, resposta_robo: respostaRobo, resposta_atendente: null,
+        remetente: 'Robô', status_atendimento: 'EM_ATENDIMENTO_ROBO',
       });
 
-      // Transferência ⇒ marca PENDENTE (desliga robô)
       if (normalized.includes(transferKey)) {
-        await supabase
-          .from('messages')
-          .update({ status_atendimento: 'PENDENTE' })
-          .eq('numero_paciente', numeroPaciente);
+        await supabase.from('messages').update({ status_atendimento: 'PENDENTE' }).eq('numero_paciente', numeroPaciente);
       }
     }
 
     return res.json({ received: true });
-  } catch (err) {
-    console.error('Webhook insert failed:', err.message);
-    return res.status(500).json({ error: 'Webhook insert failed' });
-  }
+  } catch (err) { console.error('Webhook insert failed:', err.message); return res.status(500).json({ error: 'Webhook insert failed' }); }
 });
 
 /* =================== Consultas para o painel/UI =================== */
-// Lista de conversas (uma por número) — leva em conta a ÚLTIMA linha
 app.get('/api/conversations', async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('messages')
-      .select('*')
-      .order('created_at', { ascending: true });
+    const { data, error } = await supabase.from('messages').select('*').order('created_at', { ascending: true });
     if (error) throw error;
 
     const byNumero = new Map();
     for (const msg of data) {
       const key = msg.numero_paciente;
       const prev = byNumero.get(key);
-      if (!prev || new Date(msg.created_at) > new Date(prev.created_at)) {
-        byNumero.set(key, msg);
-      }
+      if (!prev || new Date(msg.created_at) > new Date(prev.created_at)) byNumero.set(key, msg);
     }
 
     const list = [];
     for (const [numero, msg] of byNumero.entries()) {
-      // status é o da ÚLTIMA linha
       const status = msg.status_atendimento || 'EM_ATENDIMENTO_ROBO';
-      // selo legível pra UI (se quiser usar):
       let label;
       if (status === 'FINALIZADO') label = 'FINALIZADO';
       else if (status === 'PENDENTE') label = 'PENDENTE';
@@ -379,79 +301,46 @@ app.get('/api/conversations', async (req, res) => {
         lastMessage: msg.mensagem_paciente || msg.resposta_robo || msg.resposta_atendente,
         statusAtendimento: status,
         lastRemetente: msg.remetente,
-        label, // opcional p/ a UI
-        updatedAt: msg.updated_at,
-        instanceId: msg.instance_id,
+        label, updatedAt: msg.updated_at, instanceId: msg.instance_id,
       });
     }
 
     list.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
     return res.json(list);
-  } catch (err) {
-    console.error('Failed to fetch conversations:', err.message);
-    return res.status(500).json({ error: 'Failed to fetch conversations' });
-  }
+  } catch (err) { console.error('Failed to fetch conversations:', err.message); return res.status(500).json({ error: 'Failed to fetch conversations' }); }
 });
 
-// Histórico completo de um número
+// >>> NOVO: status canônico da conversa
+app.get('/api/conversation/:numero/status', async (req, res) => {
+  const numero = normalizePhone(req.params.numero);
+  try {
+    const summary = await getThreadSummary(numero);
+    if (!summary) return res.json({ numeroPaciente: numero, statusAtual: 'EM_ATENDIMENTO_ROBO', lastRemetente: null, lastMessage: null });
+    return res.json({ numeroPaciente: numero, ...summary });
+  } catch (err) { console.error('Failed to fetch conversation status:', err.message); return res.status(500).json({ error: 'Failed to fetch conversation status' }); }
+});
+
+// Histórico completo (com opção de wrapper p/ status canônico)
 app.get('/api/conversation/:numero/messages', async (req, res) => {
   const numero = normalizePhone(req.params.numero);
+  const wrap = String(req.query.wrap || '').toLowerCase() === '1';
   try {
-    const { data, error } = await supabase
-      .from('messages')
-      .select('*')
-      .eq('numero_paciente', numero)
-      .order('created_at', { ascending: true });
+    const { data, error } = await supabase.from('messages').select('*').eq('numero_paciente', numero).order('created_at', { ascending: true });
     if (error) throw error;
-    return res.json(data);
-  } catch (err) {
-    console.error('Failed to fetch conversation:', err.message);
-    return res.status(500).json({ error: 'Failed to fetch conversation' });
-  }
-});
 
-// Atualiza status (Finalizar/Reabrir manualmente)
-app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
-  const numero = normalizePhone(req.params.numero);
-  const { statusAtendimento } = req.body;
-  if (!statusAtendimento)
-    return res.status(400).json({ error: 'statusAtendimento is required' });
+    if (!wrap) {
+      // retrocompatível
+      // também mandamos um header com o status canônico pra facilitar no front atual
+      const summary = await getThreadSummary(numero);
+      if (summary?.statusAtual) res.setHeader('X-Conversation-Status', summary.statusAtual);
+      return res.json(data);
+    }
 
-  try {
-    const { error } = await supabase
-      .from('messages')
-      .update({ status_atendimento: statusAtendimento })
-      .eq('numero_paciente', numero);
-    if (error) throw error;
-    return res.json({ success: true });
-  } catch (err) {
-    console.error('Failed to update status:', err.message);
-    return res.status(500).json({ error: 'Failed to update status' });
-  }
-});
-
-// Atualiza nome do paciente
-app.patch('/api/conversation/:numero/name', jsonParser, async (req, res) => {
-  const numero = normalizePhone(req.params.numero);
-  const { nomePaciente } = req.body;
-  if (!nomePaciente)
-    return res.status(400).json({ error: 'nomePaciente is required' });
-
-  try {
-    const { error } = await supabase
-      .from('messages')
-      .update({ nome_paciente: nomePaciente })
-      .eq('numero_paciente', numero);
-    if (error) throw error;
-    return res.json({ success: true });
-  } catch (err) {
-    console.error('Failed to update name:', err.message);
-    return res.status(500).json({ error: 'Failed to update name' });
-  }
+    const summary = await getThreadSummary(numero);
+    return res.json({ statusAtual: summary?.statusAtual || 'EM_ATENDIMENTO_ROBO', lastRemetente: summary?.lastRemetente || null, messages: data });
+  } catch (err) { console.error('Failed to fetch conversation:', err.message); return res.status(500).json({ error: 'Failed to fetch conversation' }); }
 });
 
 /* ============================== Start ============================== */
 const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
-});
+app.listen(port, () => { console.log(`Server running on port ${port}`); });
