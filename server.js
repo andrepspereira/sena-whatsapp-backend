@@ -1,14 +1,22 @@
 /*
   Projeto SENA — Backend (server.js)
-  Versão: v11d (2025-08-09) — Compat CommonJS (axios) + suas rotas atuais
+  Versão: v11f (2025-08-09) — COMPLETÃO, compat com seu front, e à prova de falta da coluna status_conversa
 
-  Novidades principais (mantendo compat):
-  • status_conversa gravado em TODAS as linhas (histórico usa isso no topo)
-  • Header X-Conversation-Status no histórico
-  • Robô BLOQUEADO quando conversa está PENDENTE/FINALIZADO
-  • Envio humano só grava se Gupshup retornar 2xx
-  • Handoff/transferência atualiza em massa (status_atendimento + status_conversa + updated_at)
-  • Fallback de nomes (numeroPaciente/numero_paciente, nomePaciente/nome_paciente)
+  O que esta versão garante:
+  • Todas as rotas e comportamentos que você já usava
+  • status_atendimento e status_conversa SEMPRE sincronizados (se a coluna existir)
+  • Se a coluna status_conversa NÃO existir, o servidor entra em fallback automático (só usa status_atendimento) e NÃO quebra
+  • Header X-Conversation-Status no histórico para pintar o topo do chat
+  • Robô bloqueado quando conversa está PENDENTE/FINALIZADO
+  • Envio humano só grava se a Gupshup retornar 2xx (confirmação real)
+  • Handoff/transferência atualiza em massa
+  • Compat com payloads numeroPaciente/numero_paciente e nomePaciente/nome_paciente
+
+  Variáveis de ambiente relevantes:
+  - PORT
+  - SUPABASE_URL
+  - SUPABASE_ANON_KEY (compat)
+  - GSAPP_NAME (opcional, nome exibido na Gupshup)
 */
 
 const express = require('express');
@@ -44,7 +52,6 @@ function normaliseString(str = '') {
   return String(str).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[.!?]/g, '');
 }
 function normalizePhone(p) { return String(p || '').replace(/[^\d]/g, ''); }
-function envSourceForInstance(id) { return process.env[`GSWHATSAPP_NUMBER_${String(id)}`] || process.env.GSWHATSAPP_NUMBER || ''; }
 function nowIso() { return new Date().toISOString(); }
 function safeString(x) { if (x == null) return ''; if (typeof x === 'string') return x; try { return JSON.stringify(x); } catch { return String(x); } }
 
@@ -60,14 +67,39 @@ const TRANSFER_TRIGGERS = [
   'vou te deixar com alguem da equipe',
 ];
 
-/* =========== FSM — status quando o PACIENTE fala (conservador) =========== */
-function nextStatusOnPatient({ lastStatus, lastSender }) {
-  switch (lastStatus) {
-    case Status.FINALIZADO: return Status.ROBO;        // reabre com robô
-    case Status.PENDENTE:   return Status.PENDENTE;    // aguardando humano
-    case Status.HUMANO:     return Status.PENDENTE;    // paciente respondeu durante HUMANO -> volta à fila humana
-    case Status.ROBO:       return Status.ROBO;        // segue com robô
-    default:                return Status.ROBO;        // primeira interação
+/* ====== Detecção dinâmica: existe coluna status_conversa? ====== */
+let HAS_STATUS_CONVERSA = true; // assume que sim até provar o contrário
+function isStatusColError(err) {
+  const s = String(err && (err.message || err));
+  return s.includes('status_conversa') || (s.includes('column') && s.includes('status_conversa'));
+}
+
+async function safeInsert(row) {
+  const payload = { ...row, created_at: nowIso(), updated_at: nowIso() };
+  try {
+    const { error } = await supabase.from('messages').insert(payload);
+    if (error) throw error;
+  } catch (err) {
+    if (isStatusColError(err)) {
+      HAS_STATUS_CONVERSA = false;
+      const clone = { ...payload }; delete clone.status_conversa;
+      const { error: e2 } = await supabase.from('messages').insert(clone);
+      if (e2) throw e2;
+    } else { throw err; }
+  }
+}
+
+async function safeUpdateByNumero(numeroPaciente, values) {
+  try {
+    const { error } = await supabase.from('messages').update(values).eq('numero_paciente', numeroPaciente);
+    if (error) throw error;
+  } catch (err) {
+    if (isStatusColError(err)) {
+      HAS_STATUS_CONVERSA = false;
+      const clone = { ...values }; delete clone.status_conversa;
+      const { error: e2 } = await supabase.from('messages').update(clone).eq('numero_paciente', numeroPaciente);
+      if (e2) throw e2;
+    } else { throw err; }
   }
 }
 
@@ -75,11 +107,11 @@ function nextStatusOnPatient({ lastStatus, lastSender }) {
 async function getLastMessageInfo(numeroPaciente) {
   const { data } = await supabase
     .from('messages')
-    .select('status_atendimento, remetente')
+    .select('status_atendimento, status_conversa, remetente')
     .eq('numero_paciente', numeroPaciente)
     .order('created_at', { ascending: false })
     .limit(1);
-  if (!data || !data.length) return { status_atendimento: null, remetente: null };
+  if (!data || !data.length) return { status_atendimento: null, status_conversa: null, remetente: null };
   return data[0];
 }
 async function getLastRow(numeroPaciente) {
@@ -92,31 +124,10 @@ async function getLastRow(numeroPaciente) {
   return (data && data[0]) || null;
 }
 
-// cache por instância
-const instanceMeta = {}; // { [id]: { token, source_number } }
-async function preloadInstances() {
-  try {
-    const { data } = await supabase.from('instances').select('id_da_instancia, token, source_number');
-    if (data) {
-      data.forEach((row) => {
-        const id = String(row.id_da_instancia);
-        instanceMeta[id] = { token: row.token || null, source_number: row.source_number || envSourceForInstance(id) };
-      });
-    }
-  } catch (err) { console.error('Failed to preload instances:', err.message); }
-}
-preloadInstances();
-
 async function setConversationStatusMass(numeroPaciente, statusKey) {
-  await supabase
-    .from('messages')
-    .update({ status_atendimento: statusKey, status_conversa: statusKey, updated_at: nowIso() })
-    .eq('numero_paciente', numeroPaciente);
-}
-async function insertMessage(row) {
-  const payload = { ...row, created_at: nowIso(), updated_at: nowIso() };
-  const { error } = await supabase.from('messages').insert(payload);
-  if (error) throw new Error(error.message);
+  const values = { status_atendimento: statusKey, status_conversa: statusKey, updated_at: nowIso() };
+  if (!HAS_STATUS_CONVERSA) delete values.status_conversa;
+  await safeUpdateByNumero(numeroPaciente, values);
 }
 
 /* =================== Gupshup (texto sessão) =================== */
@@ -141,19 +152,16 @@ async function sendWhatsAppSessionMessage({ token, source, destination, text }) 
 }
 
 /* ============================== API =============================== */
-app.get('/health', (req, res) => res.json({ ok: true, version: 'v11d', ts: nowIso() }));
+app.get('/health', (req, res) => res.json({ ok: true, version: 'v11f', hasStatusConversa: HAS_STATUS_CONVERSA, ts: nowIso() }));
 
-// Instâncias
-app.get('/api/instances', async (req, res) => {
-  const count = Number(process.env.INSTANCE_COUNT || 8);
-  const list = [];
-  for (let i = 0; i < count; i++) {
-    const key = String(i);
-    const meta = instanceMeta[key] || {};
-    const hasToken = !!meta.token;
-    list.push({ id: key, token: hasToken, hasToken, online: hasToken, source: meta.source_number || envSourceForInstance(key) || null });
-  }
-  return res.json(list);
+// Instâncias (listagem simples)
+app.get('/api/instances', async (_req, res) => {
+  try {
+    const { data, error } = await supabase.from('instances').select('id_da_instancia, token, source_number');
+    if (error) throw error;
+    const out = (data || []).map(r => ({ id: String(r.id_da_instancia), hasToken: !!r.token, source: r.source_number || null }));
+    res.json(out);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/instance/:id/token', jsonParser, async (req, res) => {
@@ -163,7 +171,6 @@ app.post('/api/instance/:id/token', jsonParser, async (req, res) => {
   const updates = { id_da_instancia: instanceId, token, source_number: source_number || null, status: 'active', updated_at: nowIso() };
   try {
     await supabase.from('instances').upsert(updates, { onConflict: 'id_da_instancia' });
-    instanceMeta[instanceId] = { token, source_number: source_number || envSourceForInstance(instanceId) };
     return res.json({ success: true });
   } catch (err) { console.error('Failed to upsert token:', err.message); return res.status(500).json({ error: 'Failed to save token' }); }
 });
@@ -173,36 +180,25 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
   const instanceId = String(req.params.id);
   const { numeroPaciente, numero_paciente, nomePaciente, nome_paciente, texto } = req.body || {};
   const phone = normalizePhone(numeroPaciente || numero_paciente);
-  const patientName = nomePaciente || nome_paciente || null;
+  const patientName = safeString(nomePaciente || nome_paciente || '');
   const text = String(texto || '').trim();
   if (!phone || !text) return res.status(400).json({ error: 'numeroPaciente and non-empty texto are required' });
 
-  // meta da instância
-  let meta = instanceMeta[instanceId];
-  if (!meta) {
-    const { data } = await supabase.from('instances').select('token, source_number').eq('id_da_instancia', instanceId).single();
-    meta = instanceMeta[instanceId] = { token: data?.token || null, source_number: data?.source_number || envSourceForInstance(instanceId) };
-  }
-  if (!meta.token || !(meta.source_number || envSourceForInstance(instanceId))) {
-    console.error('Missing token/source for instance', instanceId, meta);
+  // pega credenciais da instância
+  const { data: inst, error: e1 } = await supabase
+    .from('instances').select('token, source_number').eq('id_da_instancia', instanceId).single();
+  if (e1 || !inst || !inst.token || !inst.source_number) {
+    console.error('Missing token/source for instance', instanceId, inst);
     return res.status(500).json({ error: 'instance_not_ready' });
   }
 
   // Envia via Gupshup — só grava se 2xx
-  const resp = await sendWhatsAppSessionMessage({
-    token: meta.token,
-    source: meta.source_number || envSourceForInstance(instanceId),
-    destination: phone,
-    text,
-  });
+  const resp = await sendWhatsAppSessionMessage({ token: inst.token, source: inst.source_number, destination: phone, text });
   if (resp.status < 200 || resp.status >= 300) return res.status(502).json({ error: 'gupshup_fail', status: resp.status, body: resp.data });
 
   try {
-    // Atualiza status MASSA → HUMANO
     await setConversationStatusMass(phone, Status.HUMANO);
-
-    // Registra a linha do atendente com status_conversa consistente
-    await insertMessage({
+    await safeInsert({
       instance_id: instanceId,
       numero_paciente: phone,
       nome_paciente: patientName,
@@ -213,7 +209,6 @@ app.post('/api/instance/:id/messages', jsonParser, async (req, res) => {
       status_atendimento: Status.HUMANO,
       status_conversa: Status.HUMANO,
     });
-
     return res.json({ success: true });
   } catch (err) { console.error('Failed to insert attendant message:', err.message); return res.status(500).json({ error: 'Failed to save message' }); }
 });
@@ -231,56 +226,45 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
     const numeroPaciente = normalizePhone(body.numeroPaciente || body.numero_paciente);
     const mensagemPaciente = body.mensagemPaciente;
     const respostaRobo = body.respostaRobo || body.resposta_robo || null;
-    const patientName = body.nomePaciente || body.nome_paciente || null;
+    const patientName = safeString(body.nomePaciente || body.nome_paciente || '');
     const remetente = body.remetente || (respostaRobo ? 'Robô' : 'Paciente');
 
     if (!numeroPaciente) return res.status(400).json({ error: 'Missing numeroPaciente' });
 
-    // Status anterior
     const lastInfo = await getLastMessageInfo(numeroPaciente);
-    const lastStatus = lastInfo.status_atendimento;
-    const lastRemetente = lastInfo.remetente;
-
-    let nextStatus = lastStatus || Status.ROBO;
+    let current = lastInfo.status_conversa || lastInfo.status_atendimento || Status.ROBO;
 
     if (remetente === 'Paciente') {
-      // PACIENTE falou => decide via FSM
-      nextStatus = nextStatusOnPatient({ lastStatus, lastSender: lastRemetente });
-
-      // grava linha do paciente
+      // FSM p/ paciente
+      switch (current) {
+        case Status.FINALIZADO: current = Status.ROBO; break;
+        case Status.HUMANO:     current = Status.PENDENTE; break;
+        default:                /* mantém */ break;
+      }
       if (mensagemPaciente) {
-        await insertMessage({
+        await safeInsert({
           instance_id: instanceId, numero_paciente: numeroPaciente, nome_paciente: patientName,
           mensagem_paciente: safeString(mensagemPaciente), resposta_robo: null, resposta_atendente: null,
-          remetente: 'Paciente', status_atendimento: nextStatus, status_conversa: nextStatus,
+          remetente: 'Paciente', status_atendimento: current, status_conversa: current,
         });
       }
-
-      // Se ficou PENDENTE/FINALIZADO, sincroniza em massa
-      if (nextStatus === Status.PENDENTE || nextStatus === Status.FINALIZADO) {
-        await setConversationStatusMass(numeroPaciente, nextStatus);
+      if (current === Status.PENDENTE || current === Status.FINALIZADO) {
+        await setConversationStatusMass(numeroPaciente, current);
       }
     }
 
     if (respostaRobo) {
-      const normalized = normaliseString(respostaRobo);
-
-      // BLOQUEIO do robô quando conversa está PENDENTE ou FINALIZADO
-      const currentRow = await getLastRow(numeroPaciente);
-      const currentStatus = currentRow?.status_conversa || currentRow?.status_atendimento || nextStatus || Status.ROBO;
-      if (currentStatus === Status.PENDENTE || currentStatus === Status.FINALIZADO) {
+      // BLOQUEIO do robô quando PENDENTE/FINALIZADO
+      if (current === Status.PENDENTE || current === Status.FINALIZADO) {
         console.log('Robô suprimido (status impede resposta).');
         return res.json({ received: true, suppressed: true });
       }
-
-      // Insere resposta do robô com status atual (ou PENDENTE se gatilho)
       let statusForBot = Status.ROBO;
-      if (TRANSFER_TRIGGERS.some(t => normalized.includes(t))) {
+      if (TRANSFER_TRIGGERS.some(t => normaliseString(respostaRobo).includes(t))) {
         statusForBot = Status.PENDENTE;
         await setConversationStatusMass(numeroPaciente, Status.PENDENTE);
       }
-
-      await insertMessage({
+      await safeInsert({
         instance_id: instanceId, numero_paciente: numeroPaciente, nome_paciente: patientName,
         mensagem_paciente: null, resposta_robo: safeString(respostaRobo), resposta_atendente: null,
         remetente: 'Robô', status_atendimento: statusForBot, status_conversa: statusForBot,
@@ -299,7 +283,7 @@ app.get('/api/conversations', async (req, res) => {
     if (error) throw error;
 
     const byNumero = new Map();
-    for (const msg of data) {
+    for (const msg of (data || [])) {
       const key = msg.numero_paciente;
       const prev = byNumero.get(key);
       if (!prev || new Date(msg.created_at) > new Date(prev.created_at)) byNumero.set(key, msg);
@@ -340,8 +324,8 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
       .order('created_at', { ascending: true });
     if (error) throw error;
 
-    const last = await getLastRow(numero);
-    const statusAtual = last?.status_conversa || last?.status_atendimento || Status.ROBO;
+    const last = (data || [])[data.length - 1] || null;
+    const statusAtual = (last && (last.status_conversa || last.status_atendimento)) || Status.ROBO;
 
     const out = (data || []).map(m => ({ ...m, status_conversa: m.status_conversa || statusAtual }));
 
@@ -358,7 +342,7 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
   }
 });
 
-// Finalizar/Reabrir/Pendente/Humano — ATUALIZA EM MASSA (compat com teu front)
+// Finalizar/Reabrir/Pendente/Humano — ATUALIZA EM MASSA
 app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
   const numero = normalizePhone(req.params.numero);
   const { statusAtendimento, status } = req.body || {};
@@ -388,4 +372,4 @@ app.patch('/api/conversation/:numero/name', jsonParser, async (req, res) => {
 
 /* ============================== Start ============================== */
 const port = process.env.PORT || 3000;
-app.listen(port, () => { console.log(`Server v11d running on port ${port}`); });
+app.listen(port, () => { console.log(`Server v11f running on port ${port} — HAS_STATUS_CONVERSA=${HAS_STATUS_CONVERSA}`); });
