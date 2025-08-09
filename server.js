@@ -22,7 +22,9 @@ app.use((req, res, next) => {
 
 /* ============================== Utils ============================== */
 function normaliseString(str = '') {
-  return String(str).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[.!?]/g, '');
+  return String(str).toLowerCase().normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[.!?]/g, '');
 }
 function normalizePhone(p) { return String(p || '').replace(/[^\d]/g, ''); }
 function envSourceForInstance(id) { return process.env[`GSWHATSAPP_NUMBER_${String(id)}`] || process.env.GSWHATSAPP_NUMBER || ''; }
@@ -69,6 +71,15 @@ async function getLastMessageInfo(numeroPaciente) {
     .limit(1);
   if (!data || !data.length) return { status_atendimento: null, remetente: null };
   return data[0];
+}
+async function getLastRow(numeroPaciente) {
+  const { data } = await supabase
+    .from('messages')
+    .select('*')
+    .eq('numero_paciente', numeroPaciente)
+    .order('created_at', { ascending: false })
+    .limit(1);
+  return (data && data[0]) || null;
 }
 
 // cache por instância
@@ -185,7 +196,9 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
 
     // Se ficou PENDENTE/FINALIZADO, desliga robô e SINCRONIZA (massa)
     if (patientStatus === 'PENDENTE' || patientStatus === 'FINALIZADO') {
-      await supabase.from('messages').update({ status_atendimento: patientStatus }).eq('numero_paciente', numeroPaciente);
+      await supabase.from('messages')
+        .update({ status_atendimento: patientStatus })
+        .eq('numero_paciente', numeroPaciente);
     }
 
     // 2) ROBÔ respondeu?
@@ -205,9 +218,14 @@ app.post('/api/webhook', rawBodyParser, urlencodedParser, async (req, res) => {
         remetente: 'Robô', status_atendimento: 'EM_ATENDIMENTO_ROBO',
       });
 
-      // Transferência → marca tudo como PENDENTE (desliga robô) — como era antes
+      // PATCH #2 — Transferência: marca TUDO como PENDENTE e força updated_at “agora”
       if (normalized.includes(transferKey)) {
-        await supabase.from('messages').update({ status_atendimento: 'PENDENTE' }).eq('numero_paciente', numeroPaciente);
+        await supabase.from('messages')
+          .update({
+            status_atendimento: 'PENDENTE',
+            updated_at: new Date().toISOString()
+          })
+          .eq('numero_paciente', numeroPaciente);
       }
     }
 
@@ -253,28 +271,45 @@ app.get('/api/conversations', async (req, res) => {
   } catch (err) { console.error('Failed to fetch conversations:', err.message); return res.status(500).json({ error: 'Failed to fetch conversations' }); }
 });
 
-// Histórico completo (sem normalizar, sem linhas artificiais)
+// Histórico completo (PATCH #1: força status correto na ÚLTIMA mensagem)
 app.get('/api/conversation/:numero/messages', async (req, res) => {
   const numero = normalizePhone(req.params.numero);
   try {
+    // histórico em ordem crescente
     const { data, error } = await supabase
       .from('messages')
       .select('*')
       .eq('numero_paciente', numero)
       .order('created_at', { ascending: true });
     if (error) throw error;
-    return res.json(data);
-  } catch (err) { console.error('Failed to fetch conversation:', err.message); return res.status(500).json({ error: 'Failed to fetch conversation' }); }
+
+    // pega status atual pela ÚLTIMA linha
+    const last = await getLastRow(numero);
+    const statusAtual = last?.status_atendimento || 'EM_ATENDIMENTO_ROBO';
+
+    // força SÓ a última mensagem a carregar o status atual (não mexe no banco)
+    const out = data.slice();
+    if (out.length) out[out.length - 1] = { ...out[out.length - 1], status_atendimento: statusAtual };
+
+    res.setHeader('X-Conversation-Status', statusAtual);
+    return res.json(out);
+  } catch (err) {
+    console.error('Failed to fetch conversation:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch conversation' });
+  }
 });
 
 // Finalizar/Reabrir — ATUALIZA EM MASSA (compatível com teu front)
 app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
   const numero = normalizePhone(req.params.numero);
   const { statusAtendimento } = req.body;
-  if (!statusAtendimento) return res.status(400).json({ error: 'statusAtendimento is required' });
+  if (!statusAtendimento)
+    return res.status(400).json({ error: 'statusAtendimento is required' });
 
   try {
-    await supabase.from('messages').update({ status_atendimento: statusAtendimento }).eq('numero_paciente', numero);
+    await supabase.from('messages')
+      .update({ status_atendimento: statusAtendimento, updated_at: new Date().toISOString() })
+      .eq('numero_paciente', numero);
     return res.json({ success: true });
   } catch (err) { console.error('Failed to update status:', err.message); return res.status(500).json({ error: 'Failed to update status' }); }
 });
@@ -283,7 +318,8 @@ app.patch('/api/conversation/:numero/status', jsonParser, async (req, res) => {
 app.patch('/api/conversation/:numero/name', jsonParser, async (req, res) => {
   const numero = normalizePhone(req.params.numero);
   const { nomePaciente } = req.body;
-  if (!nomePaciente) return res.status(400).json({ error: 'nomePaciente is required' });
+  if (!nomePaciente)
+    return res.status(400).json({ error: 'nomePaciente is required' });
 
   try {
     const { error } = await supabase.from('messages').update({ nome_paciente: nomePaciente }).eq('numero_paciente', numero);
