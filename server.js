@@ -273,11 +273,10 @@ app.get('/api/conversations', async (req, res) => {
   } catch (err) { console.error('Failed to fetch conversations:', err.message); return res.status(500).json({ error: 'Failed to fetch conversations' }); }
 });
 
-// Histórico completo — COMPAT HARD: última mensagem carrega status/remetente canônicos
+// Histórico completo — ULTRA COMPAT: TODAS as mensagens com status/remetente canônicos
 app.get('/api/conversation/:numero/messages', async (req, res) => {
   const numero = normalizePhone(req.params.numero);
   try {
-    // 1) histórico ascendente (como o front espera)
     const { data, error } = await supabase
       .from('messages')
       .select('*')
@@ -285,7 +284,7 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
       .order('created_at', { ascending: true });
     if (error) throw error;
 
-    // 2) pega a ÚLTIMA linha real pra status atual
+    // status atual pela ÚLTIMA linha real
     const { data: lastArr, error: e2 } = await supabase
       .from('messages')
       .select('status_atendimento')
@@ -296,7 +295,6 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
 
     const statusAtual = (lastArr && lastArr[0] && lastArr[0].status_atendimento) || 'EM_ATENDIMENTO_ROBO';
 
-    // 3) define remetente "canônico" pro cabeçalho conforme o status
     const headerSenderByStatus = {
       'PENDENTE': 'Paciente',
       'EM_ATENDIMENTO_HUMANO': 'Atendente',
@@ -305,18 +303,23 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
     };
     const headerSender = headerSenderByStatus[statusAtual] || 'Robô';
 
-    // 4) COMPAT HARD: ajusta SÓ o último item (sem tocar no banco)
-    const out = data.slice();
-    if (out.length) {
-      const last = out[out.length - 1];
-      out[out.length - 1] = {
-        ...last,
-        status_atendimento: statusAtual,
-        remetente: headerSender,
-      };
-    }
+    // 🚨 ULTRA COMPAT: força em TODAS as mensagens (só na resposta)
+    const out = data.map(m => ({
+      ...m,
+      status_atendimento: statusAtual,
+      remetente: headerSender,
+    }));
 
+    // anti-cache (garante atualização)
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('Surrogate-Control', 'no-store');
+
+    // headers auxiliares pra debug
     res.setHeader('X-Conversation-Status', statusAtual);
+    res.setHeader('X-Conversation-Remetente', headerSender);
+
     return res.json(out);
   } catch (err) {
     console.error('Failed to fetch conversation:', err.message);
