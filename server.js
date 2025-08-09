@@ -1,22 +1,14 @@
 /*
   Projeto SENA — Backend (server.js)
-  Versão: v11f (2025-08-09) — COMPLETÃO, compat com seu front, e à prova de falta da coluna status_conversa
+  Versão: v11g (2025-08-09) — COMPLETÃO + patch no histórico:
+  • Força status_conversa = statusAtual em TODAS as mensagens do payload (topo do chat não erra mais)
+  • Mantém tudo do v11f: handoff, bloqueio de robô, Gupshup 2xx, compat payloads, etc.
 
-  O que esta versão garante:
-  • Todas as rotas e comportamentos que você já usava
-  • status_atendimento e status_conversa SEMPRE sincronizados (se a coluna existir)
-  • Se a coluna status_conversa NÃO existir, o servidor entra em fallback automático (só usa status_atendimento) e NÃO quebra
-  • Header X-Conversation-Status no histórico para pintar o topo do chat
-  • Robô bloqueado quando conversa está PENDENTE/FINALIZADO
-  • Envio humano só grava se a Gupshup retornar 2xx (confirmação real)
-  • Handoff/transferência atualiza em massa
-  • Compat com payloads numeroPaciente/numero_paciente e nomePaciente/nome_paciente
-
-  Variáveis de ambiente relevantes:
+  VARS:
   - PORT
   - SUPABASE_URL
-  - SUPABASE_ANON_KEY (compat)
-  - GSAPP_NAME (opcional, nome exibido na Gupshup)
+  - SUPABASE_ANON_KEY
+  - GSAPP_NAME (opcional)
 */
 
 const express = require('express');
@@ -103,7 +95,7 @@ async function safeUpdateByNumero(numeroPaciente, values) {
   }
 }
 
-/* ==================== Supabase helpers & cache ===================== */
+/* ==================== Supabase helpers ===================== */
 async function getLastMessageInfo(numeroPaciente) {
   const { data } = await supabase
     .from('messages')
@@ -152,15 +144,19 @@ async function sendWhatsAppSessionMessage({ token, source, destination, text }) 
 }
 
 /* ============================== API =============================== */
-app.get('/health', (req, res) => res.json({ ok: true, version: 'v11f', hasStatusConversa: HAS_STATUS_CONVERSA, ts: nowIso() }));
+app.get('/health', (req, res) => res.json({ ok: true, version: 'v11g', hasStatusConversa: HAS_STATUS_CONVERSA, ts: nowIso() }));
 
 // Instâncias (listagem simples)
 app.get('/api/instances', async (_req, res) => {
   try {
     const { data, error } = await supabase.from('instances').select('id_da_instancia, token, source_number');
     if (error) throw error;
-    const out = (data || []).map(r => ({ id: String(r.id_da_instancia), hasToken: !!r.token, source: r.source_number || null }));
-    res.json(out);
+    const out = (data || []).map(r => ({
+      id: String(r.id_da_instancia ?? ''),
+      hasToken: !!r.token,
+      source: r.source_number || null,
+    }));
+    res.json(out.filter(x => x.id !== ''));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -313,7 +309,7 @@ app.get('/api/conversations', async (req, res) => {
   } catch (err) { console.error('Failed to fetch conversations:', err.message); return res.status(500).json({ error: 'Failed to fetch conversations' }); }
 });
 
-// Histórico completo — preserva mensagens; adiciona status_conversa e Header X-Conversation-Status
+// Histórico completo — 🔧 agora força status_conversa = statusAtual em TODAS as mensagens
 app.get('/api/conversation/:numero/messages', async (req, res) => {
   const numero = normalizePhone(req.params.numero);
   try {
@@ -324,16 +320,27 @@ app.get('/api/conversation/:numero/messages', async (req, res) => {
       .order('created_at', { ascending: true });
     if (error) throw error;
 
+    // status atual (última linha real)
     const last = (data || [])[data.length - 1] || null;
     const statusAtual = (last && (last.status_conversa || last.status_atendimento)) || Status.ROBO;
 
-    const out = (data || []).map(m => ({ ...m, status_conversa: m.status_conversa || statusAtual }));
+    // Força o topo a enxergar o status canônico
+    const out = (data || []).map(m => ({ ...m, status_conversa: statusAtual }));
+
+    const headerSenderByStatus = {
+      'PENDENTE': 'Paciente',
+      'EM_ATENDIMENTO_HUMANO': 'Atendente',
+      'EM_ATENDIMENTO_ROBO': 'Robô',
+      'FINALIZADO': 'Finalizado'
+    };
+    const headerSender = headerSenderByStatus[statusAtual] || 'Robô';
 
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
     res.setHeader('Surrogate-Control', 'no-store');
     res.setHeader('X-Conversation-Status', statusAtual);
+    res.setHeader('X-Conversation-Remetente', headerSender);
 
     return res.json(out);
   } catch (err) {
@@ -372,4 +379,4 @@ app.patch('/api/conversation/:numero/name', jsonParser, async (req, res) => {
 
 /* ============================== Start ============================== */
 const port = process.env.PORT || 3000;
-app.listen(port, () => { console.log(`Server v11f running on port ${port} — HAS_STATUS_CONVERSA=${HAS_STATUS_CONVERSA}`); });
+app.listen(port, () => { console.log(`Server v11g running on port ${port} — HAS_STATUS_CONVERSA=${HAS_STATUS_CONVERSA}`); });
